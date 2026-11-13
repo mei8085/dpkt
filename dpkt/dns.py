@@ -63,6 +63,11 @@ DNS_CHAOS = 3
 DNS_HESIOD = 4
 DNS_ANY = 255
 
+# Maximum number of compression pointers followed while decoding a single
+# name. This bounds the work spent on hostile pointer chains so that parse
+# time cannot grow with the depth of a malicious chain.
+DNS_MAX_POINTERS = 128
+
 
 def pack_name(name, off, label_ptrs):
     name = codecs.encode(name, 'utf-8')
@@ -91,32 +96,51 @@ def pack_name(name, off, label_ptrs):
 def unpack_name(buf, off):
     name = []
     saved_off = 0
-    start_off = off
     name_length = 0
+    jumps = 0
+    visited = set()
     while True:
         if off >= len(buf):
-            raise dpkt.NeedData()
+            raise dpkt.NeedData(
+                'truncated name: no terminating label at offset %d' % off)
         n = compat_ord(buf[off])
         if n == 0:
             off += 1
             break
         elif (n & 0xc0) == 0xc0:
+            if off + 2 > len(buf):
+                raise dpkt.NeedData(
+                    'truncated compression pointer at offset %d' % off)
             ptr = struct.unpack('>H', buf[off:off + 2])[0] & 0x3fff
-            if ptr >= start_off:
-                raise dpkt.UnpackError('Invalid label compression pointer')
+            if ptr >= len(buf):
+                raise dpkt.UnpackError(
+                    'compression pointer at offset %d points out of bounds to %d' % (off, ptr))
+            if ptr in visited:
+                raise dpkt.UnpackError(
+                    'compression pointer loop at offset %d pointing to %d' % (off, ptr))
+            visited.add(ptr)
+            jumps += 1
+            if jumps > DNS_MAX_POINTERS:
+                raise dpkt.UnpackError(
+                    'too many compression pointers (%d) in name at offset %d' % (jumps, off))
             off += 2
             if not saved_off:
                 saved_off = off
-            start_off = off = ptr
+            off = ptr
         elif (n & 0xc0) == 0x00:
+            if off + 1 + n > len(buf):
+                raise dpkt.NeedData(
+                    'truncated label of %d bytes at offset %d' % (n, off))
             off += 1
             name.append(buf[off:off + n])
             name_length += n + 1
             if name_length > 255:
-                raise dpkt.UnpackError('name longer than 255 bytes')
+                raise dpkt.UnpackError(
+                    'name longer than 255 bytes at offset %d' % off)
             off += n
         else:
-            raise dpkt.UnpackError('Invalid label length %02x' % n)
+            raise dpkt.UnpackError(
+                'invalid label length %02x at offset %d' % (n, off))
     if not saved_off:
         saved_off = off
     return codecs.decode(b'.'.join(name), 'utf-8'), saved_off
@@ -934,3 +958,86 @@ def test_cname():
 def test_invalid_rr():
     buf = define_testdata().invalid_rr
     DNS(buf)
+
+
+def catch_unpack_error(f, *args):
+    try:
+        f(*args)
+    except dpkt.UnpackError as e:
+        return str(e)
+    raise Exception('expected dpkt.UnpackError')
+
+
+def test_shared_suffix_offsets():
+    # Multiple names legally sharing a suffix must decode to the same
+    # domain, and the offset at which the next record is read must not be
+    # affected by the jump chain.
+    buf = (b'\x03www\x07example\x03com\x00'
+           b'\x03api\xc0\x04'
+           b'\x04mail\xc0\x04')
+    name1, off = unpack_name(buf, 0)
+    assert name1 == 'www.example.com'
+    assert off == 17
+    name2, off = unpack_name(buf, off)
+    assert name2 == 'api.example.com'
+    assert off == 23
+    name3, off = unpack_name(buf, off)
+    assert name3 == 'mail.example.com'
+    assert off == len(buf)
+
+
+def test_self_pointer():
+    # A name consisting of a single pointer to itself.
+    msg = catch_unpack_error(unpack_name, b'\xc0\x00', 0)
+    assert 'loop' in msg
+    assert 'offset 0' in msg and 'pointing to 0' in msg
+
+
+def test_multi_node_pointer_loop():
+    # A -> B -> A loop across two nodes.
+    msg = catch_unpack_error(unpack_name, b'\xc0\x02\xc0\x00', 0)
+    assert 'loop' in msg
+    assert 'offset 0' in msg and 'pointing to 2' in msg
+
+
+def test_out_of_bounds_pointer():
+    msg = catch_unpack_error(unpack_name, b'\x01a\xc0\xff', 0)
+    assert 'out of bounds' in msg
+    assert 'offset 2' in msg and '255' in msg
+
+
+def test_truncated_label():
+    msg = catch_unpack_error(unpack_name, b'\x05ab', 0)
+    assert 'truncated label' in msg
+    assert 'offset 0' in msg
+
+
+def test_truncated_pointer():
+    msg = catch_unpack_error(unpack_name, b'\xc0', 0)
+    assert 'truncated compression pointer' in msg
+    assert 'offset 0' in msg
+
+
+def test_unterminated_name():
+    msg = catch_unpack_error(unpack_name, b'\x01a', 0)
+    assert 'truncated name' in msg
+    assert 'offset 2' in msg
+
+
+def test_pointer_chain_bounded():
+    # A deep chain of mutually referencing names must be rejected after a
+    # bounded number of jumps instead of chasing pointers without limit.
+    depth = DNS_MAX_POINTERS + 1
+    buf = b'\x00' + b''.join(
+        struct.pack('>H', 0xc000 | (2 * k - 3 if k > 1 else 0))
+        for k in range(1, depth + 1))
+    msg = catch_unpack_error(unpack_name, buf, len(buf) - 2)
+    assert 'too many compression pointers' in msg
+
+
+def test_dns_message_with_pointer_loop():
+    # A full DNS message whose question name is a two-node pointer loop.
+    buf = (b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+           b'\xc0\x0e\xc0\x0c')
+    msg = catch_unpack_error(DNS, buf)
+    assert 'loop' in msg
