@@ -1056,3 +1056,201 @@ def test_extensions():
     hello = handshake.data
     assert len(hello.extensions) == 8
     assert hello.extensions[-1] == (65281, b'\x00')
+
+
+# --- Integration tests: fragmented handshakes, incomplete records and
+# --- malformed ClientHello length declarations -------------------------
+
+
+def _make_client_hello(server_name=b'www.example.com'):
+    """
+    Build a ClientHello handshake message (handshake header + body) carrying
+    four extensions in a known order: server_name(0), supported_groups(10),
+    ec_point_formats(11) and extended_master_secret(23).
+    """
+    sn_entry = b'\x00' + struct.pack('!H', len(server_name)) + server_name
+    sn_list = struct.pack('!H', len(sn_entry)) + sn_entry
+    ext_sni = struct.pack('!HH', 0, len(sn_list)) + sn_list
+    groups = struct.pack('!HHH', 4, 0x0017, 0x0018)
+    ext_groups = struct.pack('!HH', 10, len(groups)) + groups
+    ext_ecpf = struct.pack('!HH', 11, 2) + b'\x01\x00'
+    ext_ems = struct.pack('!HH', 23, 0)
+    extensions = ext_sni + ext_groups + ext_ecpf + ext_ems
+    body = (b'\x03\x03'                                  # client version (TLS 1.2)
+            + b'\x11' * 32                               # random
+            + b'\x00'                                    # session id (empty)
+            + struct.pack('!H', 4) + b'\x13\x01\x13\x02'  # cipher suites
+            + b'\x01\x00'                                # compression methods (null)
+            + struct.pack('!H', len(extensions)) + extensions)
+    return b'\x01' + struct.pack('!I', len(body))[1:] + body
+
+
+def _tls_record(payload, record_type=22):
+    """Wrap payload in a single TLS record."""
+    return struct.pack('!BHH', record_type, 0x0303, len(payload)) + payload
+
+
+def _sni_host_name(ext_data):
+    """Extract the first host_name out of a server_name extension body."""
+    list_len = struct.unpack('!H', ext_data[:2])[0]
+    assert ext_data[2:3] == b'\x00'  # name type: host_name
+    name_len = struct.unpack('!H', ext_data[3:5])[0]
+    assert 5 + name_len <= 2 + list_len
+    return ext_data[5:5 + name_len]
+
+
+class TestTLSHandshakeAcrossRecords(object):
+    """A ClientHello handshake message split over several TLS records must
+    reassemble into exactly the original message, with the consumed byte
+    count and the unparsed tail both exact."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.handshake = _make_client_hello()
+        # split the handshake message across three records at unaligned offsets
+        cls.chunks = [cls.handshake[:7], cls.handshake[7:40], cls.handshake[40:]]
+        cls.buf = b''.join(_tls_record(c) for c in cls.chunks)
+        cls.msgs, cls.bytes_parsed = tls_multi_factory(cls.buf)
+
+    def test_all_records_parsed(self):
+        assert len(self.msgs) == 3
+        assert all(m.type == 22 for m in self.msgs)
+
+    def test_consumed_bytes_exact(self):
+        # every byte of the buffer belongs to a complete record
+        assert self.bytes_parsed == len(self.buf)
+        assert self.bytes_parsed == sum(5 + len(c) for c in self.chunks)
+
+    def test_no_unparsed_tail(self):
+        assert self.buf[self.bytes_parsed:] == b''
+
+    def test_reassembly_restores_handshake(self):
+        reassembled = b''.join(m.data for m in self.msgs)
+        assert reassembled == self.handshake
+
+    def test_server_name_and_extension_order_not_shifted(self):
+        reassembled = b''.join(m.data for m in self.msgs)
+        handshake = TLSHandshake(reassembled)
+        hello = handshake.data
+        assert isinstance(hello, TLSClientHello)
+        # extension order preserved despite the record boundaries
+        assert [ext[0] for ext in hello.extensions] == [0, 10, 11, 23]
+        # server name reassembled without misalignment
+        assert _sni_host_name(hello.extensions[0][1]) == b'www.example.com'
+        assert [c.code for c in hello.ciphersuites] == [0x1301, 0x1302]
+
+
+class TestTLSIncompleteTrailingRecord(object):
+    """A truncated record at the end of the buffer must not consume bytes
+    belonging to it, and parsing must resume from the exact same position
+    once the rest of the record (and the next record) arrives."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.handshake = _make_client_hello()
+        cls.complete = _tls_record(cls.handshake[:20]) + _tls_record(cls.handshake[20:])
+        # trailing record declares 0x40 bytes of payload, only 2 are present
+        cls.tail = b'\x16\x03\x03\x00\x40' + b'\xde\xad'
+        cls.buf = cls.complete + cls.tail
+        cls.msgs, cls.bytes_parsed = tls_multi_factory(cls.buf)
+
+    def test_only_complete_records_parsed(self):
+        assert len(self.msgs) == 2
+
+    def test_consumed_bytes_exclude_incomplete_record(self):
+        assert self.bytes_parsed == len(self.complete)
+
+    def test_unconsumed_tail_matches_incomplete_record(self):
+        assert self.buf[self.bytes_parsed:] == self.tail
+
+    def test_parsing_resumes_at_correct_position(self):
+        # simulate the next segment of the stream: the rest of the truncated
+        # record followed by a complete, well-formed record
+        remainder = b'\xef' * (0x40 - 2)
+        server_hello_done = _tls_record(b'\x0e\x00\x00\x00')
+        segment = self.buf[self.bytes_parsed:] + remainder + server_hello_done
+
+        msgs, bytes_parsed = tls_multi_factory(segment)
+        assert len(msgs) == 2
+        # the previously truncated record is now complete
+        assert msgs[0].data == b'\xde\xad' + remainder
+        # the following record is read from the correct position, not shifted
+        # by the earlier truncation
+        assert msgs[1].data == b'\x0e\x00\x00\x00'
+        handshake = TLSHandshake(msgs[1].data)
+        assert isinstance(handshake.data, TLSServerHelloDone)
+        assert bytes_parsed == len(segment)
+        assert segment[bytes_parsed:] == b''
+
+
+class TestMalformedClientHelloLengths(object):
+    """Contradictory length declarations (extension block total length vs.
+    individual extension lengths, handshake length vs. record payload) must
+    only produce controlled parse results: a truncated value, or a
+    well-defined dpkt exception."""
+
+    def test_extension_total_length_smaller_than_extension(self):
+        # the extension block claims 8 bytes total, but the first extension
+        # alone declares 100 bytes of data with only 10 present
+        buf = struct.pack('!H', 8) + struct.pack('!HH', 0, 100) + b'A' * 10
+        extensions = parse_extensions(buf)
+        # controlled truncation: the available bytes are returned, no
+        # exception, no out-of-bounds read
+        assert extensions == [(0, b'A' * 10)]
+
+    def test_extension_total_length_smaller_than_extension_in_client_hello(self):
+        # same contradiction embedded in a full ClientHello: parsing stays
+        # controlled and yields the truncated extension
+        body = (b'\x03\x03' + b'\x11' * 32 + b'\x00'
+                + struct.pack('!H', 2) + b'\x13\x01'
+                + b'\x01\x00')
+        extensions = struct.pack('!H', 8) + struct.pack('!HH', 0, 100) + b'A' * 10
+        hs = b'\x01' + struct.pack('!I', len(body) + len(extensions))[1:] + body + extensions
+        hello = TLSHandshake(hs).data
+        assert isinstance(hello, TLSClientHello)
+        assert hello.extensions == [(0, b'A' * 10)]
+
+    def test_extension_total_length_exceeds_buffer(self):
+        # the extension block claims 0x100 bytes but the buffer ends right
+        # after the first extension; the walk off the end raises struct.error
+        import pytest
+        buf = struct.pack('!H', 0x0100) + struct.pack('!HH', 11, 2) + b'\x01\x00'
+        with pytest.raises(struct.error):
+            parse_extensions(buf)
+
+    def test_extension_total_length_exceeds_buffer_in_client_hello(self):
+        # the same contradiction inside a ClientHello surfaces as a
+        # controlled dpkt.UnpackError, not a raw struct.error
+        import pytest
+        body = (b'\x03\x03' + b'\x11' * 32 + b'\x00'
+                + struct.pack('!H', 2) + b'\x13\x01'
+                + b'\x01\x00')
+        extensions = struct.pack('!H', 0x00f0) + struct.pack('!HH', 0, 4) + b'\x00\x02\x00\x00'
+        hs = b'\x01' + struct.pack('!I', len(body) + len(extensions))[1:] + body + extensions
+        with pytest.raises(dpkt.UnpackError):
+            TLSHandshake(hs)
+
+    def test_handshake_length_exceeds_available_data(self):
+        # the handshake header declares the full ClientHello length, but the
+        # reassembled record payload is 5 bytes short
+        import pytest
+        handshake = _make_client_hello()
+        with pytest.raises(dpkt.NeedData):
+            TLSHandshake(handshake[:-5])
+
+    def test_record_length_exceeds_available_data(self):
+        # a record header declaring more payload than the buffer holds is
+        # left unparsed; consumed bytes stay at zero and the tail is intact
+        handshake = _make_client_hello()
+        buf = b'\x16\x03\x03\xff\xff' + handshake[:3]
+        msgs, bytes_parsed = tls_multi_factory(buf)
+        assert msgs == []
+        assert bytes_parsed == 0
+        assert buf[bytes_parsed:] == buf
+
+    def test_variable_array_out_of_bounds(self):
+        # a declared array length running past the buffer yields the short
+        # data plus the declared (not actual) consumed count
+        data, consumed = parse_variable_array(b'\x00\x64abc', 2)
+        assert data == b'abc'
+        assert consumed == 0x64 + 2
