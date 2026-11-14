@@ -79,11 +79,22 @@ class IP6(dpkt.Packet):
             buf = self.data
 
         next_ext_hdr = self.nxt
+        fragment_hdr = None
 
         while next_ext_hdr in EXT_HDRS:
             ext = EXT_HDRS_CLS[next_ext_hdr](buf)
+            # reject packets whose extension header claims more bytes than
+            # remain in the payload, instead of decoding the leftover bytes
+            # as a complete upper-layer packet
+            if ext.length > len(buf):
+                raise dpkt.NeedData(
+                    'extension header (%d) length %d exceeds the remaining payload %d'
+                    % (next_ext_hdr, ext.length, len(buf)))
             self.extension_hdrs[next_ext_hdr] = ext
             self.all_extension_headers.append(ext)
+            # remember the fragment header wherever it appears in the chain
+            if next_ext_hdr == ip.IP_PROTO_FRAGMENT and fragment_hdr is None:
+                fragment_hdr = ext
             buf = buf[ext.length:]
             next_ext_hdr = getattr(ext, 'nxt', None)
 
@@ -91,9 +102,10 @@ class IP6(dpkt.Packet):
         if next_ext_hdr is not None:
             self.p = next_ext_hdr
 
-        # do not decode fragments after the first fragment
+        # do not decode fragments after the first fragment, even when the
+        # fragment header is not the first header in the chain
         # https://github.com/kbandla/dpkt/issues/575
-        if self.nxt == 44 and ext.frag_off > 0:  # 44 = IP_PROTO_FRAGMENT
+        if fragment_hdr is not None and fragment_hdr.frag_off > 0:
             self.data = buf
             return
 
@@ -587,3 +599,66 @@ def test_ip6_fragment_no_decode():  # https://github.com/kbandla/dpkt/issues/575
 
     # test packing
     assert bytes(frag2) == s
+
+
+def test_ip6_extension_header_length_overflow():
+    import pytest
+
+    # hop-by-hop options header claims a length of 16 bytes (len == 1),
+    # but the payload only holds 8 bytes
+    s = (b'\x60\x00\x00\x00\x00\x08\x00\x40\xfe\x80\x00\x00\x00\x00\x00\x00'
+         b'\x00\x00\x00\x00\x00\x00\x00\x01\xfe\x80\x00\x00\x00\x00\x00\x00'
+         b'\x00\x00\x00\x00\x00\x00\x00\x02'
+         b'\x06\x01\x01\x04\x00\x00\x00\x00')
+    with pytest.raises(dpkt.NeedData):
+        IP6(s)
+
+    # same overflow one header deeper into the chain: a valid hop-by-hop
+    # header followed by a routing header whose length exceeds the payload
+    s = (b'\x60\x00\x00\x00\x00\x10\x00\x40\xfe\x80\x00\x00\x00\x00\x00\x00'
+         b'\x00\x00\x00\x00\x00\x00\x00\x01\xfe\x80\x00\x00\x00\x00\x00\x00'
+         b'\x00\x00\x00\x00\x00\x00\x00\x02'
+         b'\x2b\x00\x01\x04\x00\x00\x00\x00'  # hop-by-hop, next is routing (43)
+         b'\x06\x01\x00\x00\x00\x00\x00\x00')  # routing header claims 16 bytes
+    with pytest.raises(dpkt.NeedData):
+        IP6(s)
+
+
+def test_ip6_fragment_mid_chain_no_decode():
+    # a non-first fragment whose fragment header follows a hop-by-hop
+    # options header; the payload must not be decoded as the upper protocol
+    s = (b'\x60\x00\x00\x00\x00\x24\x00\x40\x20\x01\x06\x38\x05\x01\x8e\xfe'
+         b'\xcc\x4a\x48\x39\xfa\x79\x04\xdc\x20\x01\x05\x00\x00\x60\x00\x00'
+         b'\x00\x00\x00\x00\x00\x00\x00\x30'
+         b'\x2c\x00\x01\x04\x00\x00\x00\x00'  # hop-by-hop, next is fragment (44)
+         b'\x06\x00\x00\x08\x12\x34\x56\x78'  # fragment, frag_off == 1, next is TCP
+         b'\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x02\x20\x00'
+         b'\x00\x00\x00\x00')  # bytes that would parse as a valid TCP header
+    _ip = IP6(s)
+    assert _ip.p == 6  # TCP
+    assert len(_ip.all_extension_headers) == 2
+    assert isinstance(_ip.all_extension_headers[1], IP6FragmentHeader)
+    assert type(_ip.data) == bytes
+    assert _ip.data == s[-20:]
+
+    # test packing
+    assert bytes(_ip) == s
+
+
+def test_ip6_fragment_first_of_chain_decode():
+    # a first fragment (frag_off == 0) with the fragment header at the start
+    # of the chain, followed by a destination options header; the payload
+    # must still be decoded as TCP
+    s = (b'\x60\x00\x00\x00\x00\x24\x2c\x40\x20\x01\x06\x38\x05\x01\x8e\xfe'
+         b'\xcc\x4a\x48\x39\xfa\x79\x04\xdc\x20\x01\x05\x00\x00\x60\x00\x00'
+         b'\x00\x00\x00\x00\x00\x00\x00\x30'
+         b'\x3c\x00\x00\x00\x12\x34\x56\x78'  # fragment, frag_off == 0, next is dst opts (60)
+         b'\x06\x00\x01\x04\x00\x00\x00\x00'  # dst opts, next is TCP
+         b'\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x02\x20\x00'
+         b'\x00\x00\x00\x00')
+    _ip = IP6(s)
+    assert _ip.p == 6  # TCP
+    assert isinstance(_ip.all_extension_headers[0], IP6FragmentHeader)
+    assert isinstance(_ip.all_extension_headers[1], IP6DstOptsHeader)
+    assert isinstance(_ip.data, tcp.TCP)
+    assert _ip.data.dport == 80
