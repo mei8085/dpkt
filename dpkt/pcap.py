@@ -337,6 +337,18 @@ class Reader(object):
         self._divisor = Decimal('1E9') if magic in (TCPDUMP_MAGIC_NANO, PMUDPCT_MAGIC_NANO) else 1E6
         self.snaplen = self.__fh.snaplen
         self.filter = ''
+
+        # determine the total file size when the file object is seekable, so
+        # that declared packet lengths can be validated against the bytes
+        # actually present before attempting to read them
+        try:
+            pos = self.__f.tell()
+            self.__f.seek(0, 2)
+            self.__f_len = self.__f.tell()
+            self.__f.seek(pos)
+        except (AttributeError, IOError, OSError):
+            self.__f_len = None
+
         self.__iter = iter(self)
 
     @property
@@ -395,7 +407,21 @@ class Reader(object):
             if not buf:
                 break
             hdr = self.__ph(buf)
+            # a captured length larger than the snapshot length indicates a
+            # corrupt or malicious file; reject it instead of delivering a
+            # partial packet
+            if self.snaplen and hdr.caplen > self.snaplen:
+                raise dpkt.UnpackError(
+                    'invalid packet header: caplen %d exceeds snaplen %d' % (hdr.caplen, self.snaplen))
+            # do not attempt to read more bytes than the file actually holds
+            if self.__f_len is not None and hdr.caplen > self.__f_len - self.__f.tell():
+                raise dpkt.NeedData(
+                    'truncated packet: caplen %d exceeds %d remaining bytes' % (
+                        hdr.caplen, self.__f_len - self.__f.tell()))
             buf = self.__f.read(hdr.caplen)
+            if len(buf) < hdr.caplen:
+                raise dpkt.NeedData(
+                    'truncated packet data: expected %d bytes, got %d' % (hdr.caplen, len(buf)))
             yield (hdr.tv_sec + (hdr.tv_usec / self._divisor), buf)
 
 
@@ -464,6 +490,9 @@ class TestData():
         b'\xb2\x67\x4a\x42\xae\x91\x07\x00\x46\x00\x00\x00\x46\x00\x00\x00\x00\xc0\x9f\x32\x41\x8c\x00\xe0'
         b'\x18\xb1\x0c\xad\x08\x00\x45\x00\x00\x38\x00\x00\x40\x00\x40\x11\x65\x47\xc0\xa8\xaa\x08\xc0\xa8'
         b'\xaa\x14\x80\x1b\x00\x35\x00\x24\x85\xed'
+        # remaining 28 bytes of the 70-byte captured packet
+        b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+        b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
     )
     modified_pcap = (
         b'\x34\xcd\xb2\xa1\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04\x00\x01\x00\x00\x00'
@@ -587,6 +616,82 @@ def test_reader_modified_pcap_type():
         timestamp, pkts = next(reader)
         assert pkts == 3 * b'\xff'
         assert timestamp == 1635842876.537197000
+
+
+class TrackedBytesIO(object):
+    """BytesIO wrapper recording the largest single read() size."""
+    def __init__(self, data):
+        from .compat import BytesIO
+        self.__f = BytesIO(data)
+        self.max_read = 0
+
+    def read(self, n=-1):
+        if n > self.max_read:
+            self.max_read = n
+        return self.__f.read(n)
+
+    def seek(self, *args):
+        return self.__f.seek(*args)
+
+    def tell(self):
+        return self.__f.tell()
+
+
+def test_reader_caplen_exceeds_snaplen():
+    """A caplen larger than the snaplen must be rejected, not delivered"""
+    import pytest
+    from .compat import BytesIO
+
+    data = bytearray(TestData().pcap)
+    # snaplen is 0xffff; set caplen (LE, pkt hdr offset 24+8) to 0x10000
+    data[32:36] = b'\x00\x00\x01\x00'
+
+    reader = Reader(BytesIO(bytes(data)))
+    with pytest.raises(dpkt.UnpackError):
+        next(reader)
+
+
+def test_reader_caplen_exceeds_remaining():
+    """A caplen larger than the rest of the file must be rejected without
+    attempting to read the declared number of bytes"""
+    import pytest
+
+    data = bytearray(TestData().pcap)
+    # caplen = snaplen (0xffff) passes the snaplen check, but only 70 bytes remain
+    data[32:36] = b'\xff\xff\x00\x00'
+
+    fobj = TrackedBytesIO(bytes(data))
+    reader = Reader(fobj)
+    with pytest.raises(dpkt.NeedData):
+        next(reader)
+    # no read larger than the file/packet headers was attempted
+    assert fobj.max_read <= FileHdr.__hdr_len__
+
+
+def test_reader_truncated_packet_data():
+    """A file ending in the middle of packet data raises a parse error"""
+    import pytest
+    from .compat import BytesIO
+
+    reader = Reader(BytesIO(TestData().pcap[:-10]))
+    with pytest.raises(dpkt.NeedData):
+        next(reader)
+
+
+def test_reader_valid_file_unchanged():
+    """Packets and timestamps of a valid file are delivered as before"""
+    from .compat import BytesIO
+
+    fobj = BytesIO()
+    writer = Writer(fobj)
+    writer.writepkt(b'A' * 10, ts=1454725786.000001)
+    writer.writepkt(b'B' * 20, ts=1454725787.000002)
+    fobj.seek(0)
+
+    pkts = list(Reader(fobj))
+    assert len(pkts) == 2
+    assert pkts[0] == (1454725786.000001, b'A' * 10)
+    assert pkts[1] == (1454725787.000002, b'B' * 20)
 
 
 class WriterTestWrap:

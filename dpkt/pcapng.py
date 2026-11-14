@@ -563,6 +563,17 @@ class Reader(object):
         self.name = getattr(fileobj, 'name', '<{0}>'.format(fileobj.__class__.__name__))
         self.__f = fileobj
 
+        # determine the total file size when the file object is seekable, so
+        # that declared block lengths can be validated against the bytes
+        # actually present before attempting to read them
+        try:
+            pos = self.__f.tell()
+            self.__f.seek(0, 2)
+            self.__f_len = self.__f.tell()
+            self.__f.seek(pos)
+        except (AttributeError, IOError, OSError):
+            self.__f_len = None
+
         shb = SectionHeaderBlock()
         buf = self.__f.read(shb.__hdr_len__)
         if len(buf) < shb.__hdr_len__:
@@ -576,14 +587,25 @@ class Reader(object):
         # determine the correct byte order and reload full SHB
         if shb.bom == BYTE_ORDER_MAGIC_LE:
             self.__le = True
-            buf += self.__f.read(_swap32b(shb.len) - shb.__hdr_len__)
-            shb = SectionHeaderBlockLE(buf)
+            shb_len = _swap32b(shb.len)
         elif shb.bom == BYTE_ORDER_MAGIC:
             self.__le = False
-            buf += self.__f.read(shb.len - shb.__hdr_len__)
-            shb = SectionHeaderBlock(buf)
+            shb_len = shb.len
         else:
             raise ValueError('unknown endianness')
+
+        # validate the declared SHB length before reading the rest of it
+        if shb_len < shb.__hdr_len__:
+            raise dpkt.UnpackError(
+                'invalid SHB length {0}: smaller than the block header'.format(shb_len))
+        if self.__f_len is not None and shb_len - shb.__hdr_len__ > self.__f_len - self.__f.tell():
+            raise dpkt.NeedData(
+                'truncated SHB: block length {0} exceeds remaining file size'.format(shb_len))
+        buf += self.__f.read(shb_len - shb.__hdr_len__)
+        if len(buf) < shb_len:
+            raise dpkt.NeedData(
+                'truncated SHB: expected {0} bytes, got {1}'.format(shb_len, len(buf)))
+        shb = SectionHeaderBlockLE(buf) if self.__le else SectionHeaderBlock(buf)
 
         # check if this version is supported
         if shb.v_major != PCAPNG_VERSION_MAJOR:
@@ -592,12 +614,10 @@ class Reader(object):
         # look for a mandatory IDB
         idb = None
         while 1:
-            buf = self.__f.read(8)
-            if len(buf) < 8:
+            blk = self._read_block()
+            if blk is None:
                 break
-
-            blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
-            buf += self.__f.read(blk_len - 8)
+            blk_type, buf = blk
 
             if blk_type == PCAPNG_BT_IDB:
                 idb = (InterfaceDescriptionBlockLE(buf) if self.__le
@@ -615,9 +635,19 @@ class Reader(object):
             if opt.code == PCAPNG_OPT_IF_TSRESOL:
                 # if MSB=0, the remaining bits is a neg power of 10 (e.g. 6 means microsecs)
                 # if MSB=1, the remaining bits is a neg power of 2 (e.g. 10 means 1/1024 of second)
+                if len(opt.data) != 1:
+                    raise dpkt.UnpackError(
+                        'invalid tsresol option: expected 1 byte, got {0}'.format(len(opt.data)))
                 opt_val = struct_unpack('b', opt.data)[0]
                 pow_num = 2 if opt_val & 0b10000000 else 10
-                self._divisor = pow_num ** (opt_val & 0b01111111)
+                exponent = opt_val & 0b01111111
+                # reject absurd resolutions; the finest sensible resolutions
+                # are nanoseconds (10**-9) and 2**-63 for a 64-bit timestamp
+                if exponent > (9 if pow_num == 10 else 63):
+                    raise dpkt.UnpackError(
+                        'invalid tsresol option: {0}**-{1} resolution is not supported'.format(
+                            pow_num, exponent))
+                self._divisor = pow_num ** exponent
 
             elif opt.code == PCAPNG_OPT_IF_TSOFFSET:
                 # 64-bit int that specifies an offset (in seconds) that must be added to the
@@ -633,6 +663,32 @@ class Reader(object):
         self.snaplen = idb.snaplen
         self.filter = ''
         self.__iter = iter(self)
+
+    def _read_block(self):
+        """Read the next pcapng block.
+
+        Returns a (block_type, buf) tuple, or None when no complete block
+        header remains. Declared block lengths are validated against the
+        remaining file size before any data is read.
+        """
+        buf = self.__f.read(8)
+        if len(buf) < 8:
+            return None
+
+        blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
+        if blk_len < 12:
+            raise dpkt.UnpackError(
+                'invalid block length {0}: smaller than the block header'.format(blk_len))
+        if self.__f_len is not None and blk_len - 8 > self.__f_len - self.__f.tell():
+            raise dpkt.NeedData(
+                'truncated block: block length {0} exceeds {1} remaining bytes'.format(
+                    blk_len, self.__f_len - self.__f.tell()))
+
+        body = self.__f.read(blk_len - 8)
+        if len(body) < blk_len - 8:
+            raise dpkt.NeedData(
+                'truncated block: expected {0} bytes, got {1}'.format(blk_len - 8, len(body)))
+        return blk_type, buf + body
 
     @property
     def fd(self):
@@ -686,19 +742,25 @@ class Reader(object):
 
     def __iter__(self):
         while 1:
-            buf = self.__f.read(8)
-            if len(buf) < 8:
+            blk = self._read_block()
+            if blk is None:
                 break
-
-            blk_type, blk_len = struct_unpack('<II' if self.__le else '>II', buf)
-            buf += self.__f.read(blk_len - 8)
+            blk_type, buf = blk
 
             if blk_type == PCAPNG_BT_EPB:
                 epb = EnhancedPacketBlockLE(buf) if self.__le else EnhancedPacketBlock(buf)
+                if len(epb.pkt_data) < epb.caplen:
+                    raise dpkt.NeedData(
+                        'truncated packet data: expected {0} bytes, got {1}'.format(
+                            epb.caplen, len(epb.pkt_data)))
                 ts = self._tsoffset + (((epb.ts_high << 32) | epb.ts_low) / self._divisor)
                 yield (ts, epb.pkt_data)
             elif blk_type == PCAPNG_BT_PB:
                 pb = PacketBlockLE(buf) if self.__le else PacketBlock(buf)
+                if len(pb.pkt_data) < pb.caplen:
+                    raise dpkt.NeedData(
+                        'truncated packet data: expected {0} bytes, got {1}'.format(
+                            pb.caplen, len(pb.pkt_data)))
                 ts = self._tsoffset + (((pb.ts_high << 32) | pb.ts_low) / self._divisor)
                 yield (ts, pb.pkt_data)
 
@@ -962,6 +1024,98 @@ def test_pcapng_header():
         Reader(fobj)
     except Exception as e:
         assert isinstance(e, ValueError)
+
+
+def _epb_offset(data):
+    """Offset of the first block after SHB and IDB in a little-endian file"""
+    shb_len = struct_unpack('<I', data[4:8])[0]
+    idb_len = struct_unpack('<I', data[shb_len + 4:shb_len + 8])[0]
+    return shb_len + idb_len
+
+
+def test_reader_block_len_too_small():
+    """A block length smaller than the block header must be rejected"""
+    import pytest
+
+    data = bytearray(define_testdata().valid_pcapng)
+    off = _epb_offset(data)
+    data[off + 4:off + 8] = b'\x08\x00\x00\x00'  # blk_len = 8 < 12
+
+    reader = Reader(BytesIO(bytes(data)))
+    with pytest.raises(dpkt.UnpackError):
+        next(reader)
+
+
+def test_reader_block_len_exceeds_remaining():
+    """A block length larger than the rest of the file must be rejected
+    without attempting to read the declared number of bytes"""
+    import pytest
+
+    class TrackedBytesIO(BytesIO):
+        max_read = 0
+
+        def read(self, n=-1):
+            if n > self.max_read:
+                self.max_read = n
+            return BytesIO.read(self, n)
+
+    data = bytearray(define_testdata().valid_pcapng)
+    off = _epb_offset(data)
+    data[off + 4:off + 8] = b'\xff\xff\xff\xff'  # blk_len = 0xffffffff
+
+    fobj = TrackedBytesIO(bytes(data))
+    reader = Reader(fobj)
+    with pytest.raises(dpkt.NeedData):
+        next(reader)
+    # no read anywhere near the declared 4 GiB was attempted
+    assert fobj.max_read < 1024
+
+
+def test_reader_truncated_block():
+    """A file ending in the middle of a block raises a parse error"""
+    import pytest
+
+    data = define_testdata().valid_pcapng
+    reader = Reader(BytesIO(data[:-10]))
+    with pytest.raises(dpkt.NeedData):
+        next(reader)
+
+
+def test_reader_bad_tsresol():
+    """An absurd if_tsresol option is rejected; reading a valid file
+    afterwards is unaffected"""
+    import pytest
+
+    for bad_val in (b'\x7f', b'\xff', b''):
+        shb = define_testdata().valid_shb_le
+        idb = define_testdata().valid_idb_le
+        for opt in idb.opts:
+            if opt.code == PCAPNG_OPT_IF_TSRESOL:
+                opt.data = bad_val
+        with pytest.raises(dpkt.UnpackError):
+            Reader(BytesIO(bytes(shb) + bytes(idb)))
+
+    reader = Reader(BytesIO(define_testdata().valid_pcapng))
+    ts, pkt = next(reader)
+    assert ts == 1442984653.210838
+    assert len(pkt) == 74
+
+
+def test_reader_tsresol_nano():
+    """A nanosecond if_tsresol option is applied to packet timestamps"""
+    shb = define_testdata().valid_shb_le
+    idb = define_testdata().valid_idb_le
+    for opt in idb.opts:
+        if opt.code == PCAPNG_OPT_IF_TSRESOL:
+            opt.data = b'\x09'
+    epb = define_testdata().valid_epb_le
+    epb.ts_high = 0
+    epb.ts_low = 123456789
+
+    reader = Reader(BytesIO(bytes(shb) + bytes(idb) + bytes(epb)))
+    ts, pkt = next(reader)
+    assert ts == 0.123456789
+    assert pkt == epb.pkt_data
 
 
 def define_testdata():
