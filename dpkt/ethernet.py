@@ -116,11 +116,16 @@ class Ethernet(dpkt.Packet):
                 if lbl.s:  # bottom of stack
                     break
 
-            # poor man's heuristics to guessing the next type
-            if compat_ord(buf[0]) == 0x45:  # IP version 4 + header len 20 bytes
+            # poor man's heuristics to guessing the next type; a label stack
+            # without a bottom-of-stack label or without any payload left is
+            # truncated, and there is nothing further to decode
+            if not buf:
+                self._next_type = None
+
+            elif compat_ord(buf[0]) == 0x45:  # IP version 4 + header len 20 bytes
                 self._next_type = ETH_TYPE_IP
 
-            elif compat_ord(buf[0]) & 0xf0 == 0x60:  # IP version 6 
+            elif compat_ord(buf[0]) & 0xf0 == 0x60:  # IP version 6
                 self._next_type = ETH_TYPE_IP6
 
             # pseudowire Ethernet
@@ -131,8 +136,11 @@ class Ethernet(dpkt.Packet):
 
         try:
             eth_type = self._next_type or self.type
-            self.data = self._typesw[eth_type](buf)
+            cls = self._typesw[eth_type]
+            self.data = dpkt._unpack_payload(self, cls, buf)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise  # nesting budget exhausted; terminate instead of keeping bytes
         except (KeyError, dpkt.UnpackError):
             self.data = buf
 
@@ -150,12 +158,21 @@ class Ethernet(dpkt.Packet):
             buf = buf[tag.__hdr_len__:]
             self.vlan_tags = [tag]
             self.vlan = tag.id  # backward compatibility
-            self.unpack(buf)
+            # ISL re-enters this method on the same object for each tag; the
+            # nesting has to draw from the same depth budget as any other
+            # encapsulated layer, or a stack of ISL headers recurses forever.
+            depth = self._depth
+            self._depth = dpkt._next_depth(self)
+            try:
+                self.unpack(buf)
+            finally:
+                self._depth = depth
 
         elif self.data.startswith(b'\xff\xff'):
             # Novell "raw" 802.3
             self.type = ETH_TYPE_IPX
-            self.data = self.ipx = self._typesw[ETH_TYPE_IPX](self.data[2:])
+            cls = self._typesw[ETH_TYPE_IPX]
+            self.data = self.ipx = dpkt._unpack_payload(self, cls, self.data[2:])
 
         elif self.type == ETH_TYPE_UNKNOWN:
             # Unknown type, assume Ethernet
@@ -873,3 +890,224 @@ def test_eth_novell():
     assert isinstance(eth.data, dpkt.ipx.IPX)
     assert eth.data.tc == 2
     assert eth.data.data == b''
+
+
+# Encapsulation nesting: GRE, IP-in-IP, IPv6-in-IPv6, ISL and MPLS pseudowires
+# all decode their payload recursively. These tests pin down that (a) a packet
+# nested past the budget terminates with a dpkt error instead of a
+# RecursionError from the interpreter, (b) truncating an inner header never
+# leaks a non-dpkt exception, and (c) one or two legal tunnel layers still
+# decode and re-pack to the same bytes.
+
+# IPv4 header (protocol 1) + ICMP echo with valid header/checksum fields, so a
+# parsed layer re-packs to the same bytes without rewriting any checksum
+_IPV4_ICMP = (b'\x45\x00\x00\x1c\x00\x00\x00\x00\x40\x01\x66\xdf'
+              b'\x0a\x00\x00\x01\x0a\x00\x00\x02'
+              b'\x08\x00\xf7\xfc\x00\x01\x00\x02')
+_MPLS_LABEL = struct.pack('>I', (16 << 12) | (1 << 8) | 64)  # bottom of stack
+
+
+def _tunnel_layers(pkt):
+    """Number of decoded layers in a packet stack (test helper)."""
+    n = 0
+    while isinstance(pkt, dpkt.Packet):
+        n += 1
+        pkt = pkt.data
+    return n
+
+
+def test_encapsulation_depth_limit_teb():
+    import pytest
+
+    # Transparent Ethernet Bridging (EtherType 0x6558): Ethernet-in-Ethernet
+    buf = b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP
+    for _ in range(4 * dpkt.MAX_RECURSION_DEPTH):
+        buf = b'\x00' * 12 + b'\x65\x58' + buf
+    with pytest.raises(dpkt.EncapsulationDepthError, match=r'maximum encapsulation depth \(64\)'):
+        Ethernet(buf)
+
+
+def test_encapsulation_depth_limit_ipip():
+    import pytest
+
+    from . import ip as ipmod
+
+    # IPv4-in-IPv4 (protocol 4)
+    buf = _IPV4_ICMP
+    for _ in range(4 * dpkt.MAX_RECURSION_DEPTH):
+        buf = b'\x45\x00' + struct.pack('>H', 20 + len(buf)) + \
+              b'\x00\x00\x00\x00\x40\x04\x00\x00\x0a\x00\x00\x01\x0a\x00\x00\x02' + buf
+    with pytest.raises(dpkt.EncapsulationDepthError, match=r'maximum encapsulation depth \(64\)'):
+        ipmod.IP(buf)
+
+
+def test_encapsulation_depth_limit_ip6_in_ip6():
+    import pytest
+
+    from . import ip6 as ip6mod
+
+    src, dst = b'\x11' * 16, b'\x22' * 16
+    buf = struct.pack('>IHBB', 0x60000000, 0, 59, 64) + src + dst
+    for _ in range(4 * dpkt.MAX_RECURSION_DEPTH):
+        buf = struct.pack('>IHBB', 0x60000000, len(buf), 41, 64) + src + dst + buf
+    with pytest.raises(dpkt.EncapsulationDepthError, match=r'maximum encapsulation depth \(64\)'):
+        ip6mod.IP6(buf)
+
+
+def test_encapsulation_depth_limit_isl():
+    import pytest
+
+    # Cisco ISL re-enters Ethernet.unpack on the same object for each tag
+    isl = (b'\x01\x00\x0c\x00\x00' b'\x00' b'\x01\x02\x03\x04\x05\x06' b'\x00\x00'
+           b'\xaa\xaa\x03' b'\x00\x00\x0c' b'\x00\x01' b'\x00\x00' b'\x00\x00')
+    buf = isl * (4 * dpkt.MAX_RECURSION_DEPTH) + b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP
+    with pytest.raises(dpkt.EncapsulationDepthError, match=r'maximum encapsulation depth \(64\)'):
+        Ethernet(buf)
+
+
+def test_encapsulation_depth_limit_mpls():
+    import pytest
+
+    # an MPLS pseudowire carrying an Ethernet frame that carries another one;
+    # non-zero MAC addresses keep the payload from looking like a pseudowire
+    # control word (the 0x0000 heuristic in Ethernet._unpack_data)
+    eth_hdr = b'\xaa' * 6 + b'\xbb' * 6
+    buf = eth_hdr + b'\x08\x00' + _IPV4_ICMP
+    for _ in range(4 * dpkt.MAX_RECURSION_DEPTH):
+        buf = eth_hdr + b'\x88\x47' + _MPLS_LABEL + buf
+    with pytest.raises(dpkt.EncapsulationDepthError, match=r'maximum encapsulation depth \(64\)'):
+        Ethernet(buf)
+
+
+def test_encapsulation_depth_limit_gre():
+    import pytest
+
+    from . import ip as ipmod
+
+    # GRE (IPv4 protocol 47) carrying IPv4, nested inside IPv4
+    buf = _IPV4_ICMP
+    for _ in range(4 * dpkt.MAX_RECURSION_DEPTH):
+        gre = b'\x00\x00\x08\x00' + buf
+        buf = b'\x45\x00' + struct.pack('>H', 20 + len(gre)) + \
+              b'\x00\x00\x00\x00\x40\x2f\x00\x00\x0a\x00\x00\x01\x0a\x00\x00\x02' + gre
+    with pytest.raises(dpkt.EncapsulationDepthError, match=r'maximum encapsulation depth \(64\)'):
+        ipmod.IP(buf)
+
+
+def test_legal_tunnels_roundtrip():
+    from . import icmp
+    from . import ip as ipmod
+    from . import ip6 as ip6mod
+
+    # Ethernet - TEB - Ethernet - IP - ICMP
+    frame = b'\x00' * 12 + b'\x65\x58' + b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP
+    eth = Ethernet(frame)
+    assert isinstance(eth.data, Ethernet)
+    assert isinstance(eth.data.data, ipmod.IP)
+    assert _tunnel_layers(eth) >= 4  # Ethernet, Ethernet, IP, ICMP
+    assert bytes(eth) == frame
+
+    # Ethernet - 802.1Q - TEB - Ethernet - IP
+    frame = b'\x00' * 12 + b'\x81\x00\x00\x64\x65\x58' + b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP
+    eth = Ethernet(frame)
+    assert isinstance(eth.data, Ethernet)
+    assert isinstance(eth.data.data, ipmod.IP)
+    assert bytes(eth) == frame
+
+    # Ethernet - MPLS - MPLS - IP - ICMP
+    frame = (b'\x00' * 12 + b'\x88\x47' + struct.pack('>I', (18 << 12) | 64) +
+             _MPLS_LABEL + _IPV4_ICMP)
+    eth = Ethernet(frame)
+    assert [lbl.val for lbl in eth.mpls_labels] == [18, 16]
+    assert isinstance(eth.data, ipmod.IP)
+    assert bytes(eth) == frame
+
+    # Ethernet - MPLS - MPLS - PW ECW - Ethernet - IP
+    frame = (b'\x00' * 12 + b'\x88\x47' + struct.pack('>I', (18 << 12) | 64) +
+             _MPLS_LABEL + b'\x00\x00\x00\x00' + b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP)
+    eth = Ethernet(frame)
+    assert isinstance(eth.data, Ethernet)
+    assert isinstance(eth.data.data, ipmod.IP)
+
+    # IP-in-IP: two layers decode down to the quoted ICMP and re-pack
+    ipip = (b'\x45\x00' + struct.pack('>H', 20 + len(_IPV4_ICMP)) +
+            b'\x00\x00\x00\x00\x40\x04\x66\xc8\x0a\x00\x00\x01\x0a\x00\x00\x02' + _IPV4_ICMP)
+    pkt = ipmod.IP(ipip)
+    assert isinstance(pkt.data, ipmod.IP)
+    assert isinstance(pkt.data.data, icmp.ICMP)
+    assert _tunnel_layers(pkt) == 4  # outer IP, inner IP, ICMP, ICMP.Echo
+    assert bytes(pkt) == ipip
+
+    # IPv6-in-IPv6
+    src, dst = b'\x11' * 16, b'\x22' * 16
+    inner6 = struct.pack('>IHBB', 0x60000000, 0, 59, 64) + src + dst
+    outer6 = struct.pack('>IHBB', 0x60000000, len(inner6), 41, 64) + src + dst + inner6
+    pkt = ip6mod.IP6(outer6)
+    assert isinstance(pkt.data, ip6mod.IP6)
+    assert bytes(pkt) == outer6
+
+
+def test_truncated_tunnel_frames_raise_dpkt_errors():
+    # Every truncation of a legal tunneled frame must end in a dpkt error or a
+    # clean parse, never in IndexError/struct.error/AttributeError.
+    pw = (b'\x00' * 12 + b'\x88\x47' + struct.pack('>I', (18 << 12) | 64) +
+          _MPLS_LABEL + b'\x00\x00\x00\x00' + b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP)
+    frames = [
+        b'\x00' * 12 + b'\x88\x47' + _MPLS_LABEL + _IPV4_ICMP,
+        b'\x00' * 12 + b'\x88\x47' + _MPLS_LABEL + struct.pack('>I', (16 << 12) | 64) + _IPV4_ICMP,
+        pw,
+        b'\x00' * 12 + b'\x65\x58' + b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP,
+    ]
+    for frame in frames:
+        for n in range(len(frame) + 1):
+            try:
+                Ethernet(frame[:n])
+            except dpkt.Error:
+                pass  # documented dpkt failure, including NeedData
+
+
+def test_encapsulation_depth_limit_survives_low_recursion_limit():
+    import sys
+
+    import pytest
+
+    # A caller may run with a lowered interpreter recursion limit; the budget
+    # must still surface as a dpkt error rather than a raw RecursionError.
+    eth_hdr = b'\x00' * 12 + b'\x65\x58'
+    buf = b'\x00' * 12 + b'\x08\x00' + _IPV4_ICMP
+    for _ in range(2 * dpkt.MAX_RECURSION_DEPTH):
+        buf = eth_hdr + buf
+
+    original = sys.getrecursionlimit()
+    sys.setrecursionlimit(120)
+    try:
+        with pytest.raises(dpkt.EncapsulationDepthError):
+            Ethernet(buf)
+    finally:
+        sys.setrecursionlimit(original)
+
+
+def test_ip6_fragment_header_followed_by_extension_header():
+    from . import ip6 as ip6mod
+    from . import tcp as tcpmod
+
+    tcp = b'\x04\xd2\x00\x50\x00\x00\x00\x01\x00\x00\x00\x00\x50\x02\x20\x00\x00\x00\x00\x00'
+    src, dst = b'\x00' * 16, b'\x11' * 16
+
+    # fragment header (not last in the chain) -> destination options -> TCP;
+    # the last extension header is not the fragment header
+    payload = (b'\x3c\x00\x00\x00\x00\x00\x00\x01' +
+               b'\x06\x00' + b'\x01\x04\x00\x00\x00\x00' + tcp)
+    buf = struct.pack('>IHBB', 0x60000000, len(payload), 44, 64) + src + dst + payload
+    pkt = ip6mod.IP6(buf)
+    assert [type(h) for h in pkt.all_extension_headers] == [ip6mod.IP6FragmentHeader, ip6mod.IP6DstOptsHeader]
+    assert isinstance(pkt.data, tcpmod.TCP)
+
+    # the same layout with a non-zero fragment offset keeps the payload raw
+    # (frag_off is the 13 high bits of the 16-bit offset/reserved/M field)
+    payload = (b'\x3c\x00\x00\x08\x00\x00\x00\x01' +
+               b'\x06\x00' + b'\x01\x04\x00\x00\x00\x00' + tcp)
+    buf = struct.pack('>IHBB', 0x60000000, len(payload), 44, 64) + src + dst + payload
+    pkt = ip6mod.IP6(buf)
+    assert isinstance(pkt.data, bytes)
+    assert bytes(pkt) == buf

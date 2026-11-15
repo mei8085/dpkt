@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- Bounded recursive decapsulation: Ethernet-in-Ethernet (TEB), IPv4-in-IPv4, IPv6-in-IPv6, GRE, ISL and MPLS pseudowires now stop at ``dpkt.MAX_RECURSION_DEPTH`` (64) layers and raise ``dpkt.EncapsulationDepthError`` instead of letting a ``RecursionError`` escape from the interpreter. The budget is adjustable at runtime.
+- Truncated inner tunnel headers no longer raise ``IndexError``/``AttributeError``; they fall back to the regular ``dpkt.UnpackError`` handling.
+- Fixed IPv6 decoding when a fragment header is followed by another extension header.
+
 ## 1.9.8
 **[2022-08-17]**
 - Fixed endianness issues in PCAPNG, Loopback

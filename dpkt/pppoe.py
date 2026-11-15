@@ -54,7 +54,9 @@ class PPPoE(dpkt.Packet):
             if self.code == 0:
                 # We need to use the pppoe.PPP header here, because PPPoE
                 # doesn't do the normal encapsulation.
-                self.data = self.ppp = PPP(self.data)
+                self.data = self.ppp = dpkt._unpack_payload(self, PPP, self.data)
+        except dpkt.EncapsulationDepthError:
+            raise
         except dpkt.UnpackError:
             pass
 
@@ -75,8 +77,10 @@ class PPP(ppp.PPP):
                 raise dpkt.NeedData
             self.data = self.data[1:]
         try:
-            self.data = self._protosw[self.p](self.data)
+            self.data = dpkt._unpack_payload(self, self._protosw[self.p], self.data)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise
         except (KeyError, struct.error, dpkt.UnpackError):
             pass
 

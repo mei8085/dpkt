@@ -30,8 +30,10 @@ class SLL(dpkt.Packet):
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         try:
-            self.data = self._typesw[self.ethtype](self.data)
+            self.data = dpkt._unpack_payload(self, self._typesw[self.ethtype], self.data)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise
         except (KeyError, dpkt.UnpackError):
             pass
 

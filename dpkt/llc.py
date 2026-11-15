@@ -38,16 +38,18 @@ class LLC(dpkt.Packet):
             self.oui, self.type = struct.unpack('>IH', b'\x00' + self.data[:5])
             self.data = self.data[5:]
             try:
-                self.data = Ethernet.get_type(self.type)(self.data)
+                self.data = dpkt._unpack_payload(self, Ethernet.get_type(self.type), self.data)
                 setattr(self, self.data.__class__.__name__.lower(), self.data)
+            except dpkt.EncapsulationDepthError:
+                raise
             except (KeyError, dpkt.UnpackError):
                 pass
         else:
             # non-SNAP
             if self.dsap == 0x06:  # SAP_IP
-                self.data = self.ip = Ethernet.get_type(ETH_TYPE_IP)(self.data)
+                self.data = self.ip = dpkt._unpack_payload(self, Ethernet.get_type(ETH_TYPE_IP), self.data)
             elif self.dsap == 0x10 or self.dsap == 0xe0:  # SAP_NETWARE{1,2}
-                self.data = self.ipx = Ethernet.get_type(ETH_TYPE_IPX)(self.data)
+                self.data = self.ipx = dpkt._unpack_payload(self, Ethernet.get_type(ETH_TYPE_IPX), self.data)
             elif self.dsap == 0x42:  # SAP_STP
                 self.data = self.stp = stp.STP(self.data)
 

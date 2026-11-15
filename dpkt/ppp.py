@@ -57,8 +57,10 @@ class PPP(dpkt.Packet):
                 raise dpkt.NeedData
             self.data = self.data[1:]
         try:
-            self.data = self._protosw[self.p](self.data)
+            self.data = dpkt._unpack_payload(self, self._protosw[self.p], self.data)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise
         except (KeyError, struct.error, dpkt.UnpackError):
             pass
 

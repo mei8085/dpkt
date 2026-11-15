@@ -103,7 +103,7 @@ class ICMP(dpkt.Packet):
         def unpack(self, buf):
             dpkt.Packet.unpack(self, buf)
             from . import ip
-            self.data = self.ip = ip.IP(self.data)
+            self.data = self.ip = dpkt._unpack_payload(self, ip.IP, self.data)
 
     class Unreach(Quote):
         __hdr__ = (('pad', 'H', 0), ('mtu', 'H', 0))
@@ -125,8 +125,10 @@ class ICMP(dpkt.Packet):
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         try:
-            self.data = self._typesw[self.type](self.data)
+            self.data = dpkt._unpack_payload(self, self._typesw[self.type], self.data)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise
         except (KeyError, dpkt.UnpackError):
             pass
 

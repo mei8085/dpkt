@@ -79,11 +79,16 @@ class IP6(dpkt.Packet):
             buf = self.data
 
         next_ext_hdr = self.nxt
+        fragment_hdr = None
 
         while next_ext_hdr in EXT_HDRS:
             ext = EXT_HDRS_CLS[next_ext_hdr](buf)
             self.extension_hdrs[next_ext_hdr] = ext
             self.all_extension_headers.append(ext)
+            # remember the fragment header wherever it appears in the chain; the
+            # last header is not necessarily the fragment header
+            if next_ext_hdr == ip.IP_PROTO_FRAGMENT and fragment_hdr is None:
+                fragment_hdr = ext
             buf = buf[ext.length:]
             next_ext_hdr = getattr(ext, 'nxt', None)
 
@@ -93,13 +98,15 @@ class IP6(dpkt.Packet):
 
         # do not decode fragments after the first fragment
         # https://github.com/kbandla/dpkt/issues/575
-        if self.nxt == 44 and ext.frag_off > 0:  # 44 = IP_PROTO_FRAGMENT
+        if fragment_hdr is not None and fragment_hdr.frag_off > 0:
             self.data = buf
             return
 
         try:
-            self.data = self._protosw[next_ext_hdr](buf)
+            self.data = dpkt._unpack_payload(self, self._protosw[next_ext_hdr], buf)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise  # nesting budget exhausted; terminate instead of keeping bytes
         except (KeyError, dpkt.UnpackError):
             self.data = buf
 

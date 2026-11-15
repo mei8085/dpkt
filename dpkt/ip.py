@@ -121,8 +121,14 @@ class IP(dpkt.Packet):
         else:  # very likely due to TCP segmentation offload
             buf = buf[self.__hdr_len__ + ol:]
         try:
-            self.data = self._protosw[self.p](buf) if self.offset == 0 else buf
+            if self.offset == 0:
+                cls = self._protosw[self.p]
+                self.data = dpkt._unpack_payload(self, cls, buf)
+            else:
+                self.data = buf
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise  # nesting budget exhausted; terminate instead of keeping bytes
         except (KeyError, dpkt.UnpackError):
             self.data = buf
 

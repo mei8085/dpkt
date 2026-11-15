@@ -104,8 +104,11 @@ class GRE(dpkt.Packet):
                     break
             self.sre = l_
         try:
-            self.data = ethernet.Ethernet._typesw[self.p](self.data)
+            cls = ethernet.Ethernet._typesw[self.p]
+            self.data = dpkt._unpack_payload(self, cls, self.data)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise  # nesting budget exhausted; terminate instead of keeping bytes
         except (KeyError, dpkt.UnpackError):
             # data already set
             pass

@@ -35,8 +35,10 @@ class AH(dpkt.Packet):
         buf = self.data[auth_len:]
 
         try:
-            self.data = ip.IP.get_proto(self.nxt)(buf)
+            self.data = dpkt._unpack_payload(self, ip.IP.get_proto(self.nxt), buf)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise
         except (KeyError, dpkt.UnpackError):
             self.data = buf
 

@@ -65,7 +65,7 @@ class ICMP6(dpkt.Packet):
         def unpack(self, buf):
             dpkt.Packet.unpack(self, buf)
             from . import ip6
-            self.data = self.ip6 = ip6.IP6(self.data)
+            self.data = self.ip6 = dpkt._unpack_payload(self, ip6.IP6, self.data)
 
     class Unreach(Error):
         pass
@@ -87,7 +87,9 @@ class ICMP6(dpkt.Packet):
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         try:
-            self.data = self._typesw[self.type](self.data)
+            self.data = dpkt._unpack_payload(self, self._typesw[self.type], self.data)
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+        except dpkt.EncapsulationDepthError:
+            raise
         except (KeyError, dpkt.UnpackError):
             pass

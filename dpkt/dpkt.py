@@ -7,11 +7,26 @@ The dpkt project is a python module for fast, simple packet parsing, with defini
 from __future__ import absolute_import, print_function
 
 import copy
+import inspect
 import struct
+import sys
 from functools import partial
 from itertools import chain
 
 from .compat import compat_ord, compat_izip, iteritems, ntole
+
+try:
+    _RECURSION_ERRORS = (RecursionError,)
+except NameError:  # Python 2 has no dedicated stack-exhaustion exception class
+    _RECURSION_ERRORS = ()
+
+
+# Maximum number of encapsulated layers that a single parse will decode.
+# Encapsulation protocols (Ethernet-in-Ethernet, IPv4-in-IPv4, IPv6-in-IPv6,
+# GRE, ISL, MPLS pseudowires and similar) are decoded recursively; without a
+# budget, a small, specially crafted packet can exhaust the Python call stack.
+# ``dpkt.MAX_RECURSION_DEPTH`` is the knob exposed to callers.
+MAX_RECURSION_DEPTH = 64
 
 
 class Error(Exception):
@@ -22,12 +37,95 @@ class UnpackError(Error):
     pass
 
 
+class EncapsulationDepthError(UnpackError):
+    """Raised when a packet nests more encapsulated layers than MAX_RECURSION_DEPTH.
+
+    It derives from UnpackError, which is the conventional dpkt parse-failure
+    type, but the encapsulation dispatch sites re-raise it explicitly so that it
+    is not downgraded to raw bytes the way an ordinary malformed payload is.
+    """
+
+
 class NeedData(UnpackError):
     pass
 
 
 class PackError(Error):
     pass
+
+
+def _depth_limit():
+    """Return the active encapsulation budget (``dpkt.MAX_RECURSION_DEPTH``)."""
+    return getattr(sys.modules.get(__package__), 'MAX_RECURSION_DEPTH', MAX_RECURSION_DEPTH)
+
+
+def _next_depth(pkt):
+    """Return the depth to use for an encapsulated payload of ``pkt``.
+
+    Raises EncapsulationDepthError once the nesting budget is exhausted, so
+    that a hostile, deeply nested packet ends with a dpkt error instead of a
+    RecursionError escaping from the interpreter.
+    """
+    depth = getattr(pkt, '_depth', 0) + 1
+    limit = _depth_limit()
+    if depth > limit:
+        raise EncapsulationDepthError(
+            'maximum encapsulation depth (%d) exceeded' % limit)
+    return depth
+
+
+_DEPTH_KWARG_CACHE_ATTR = '__dpkt_accepts_depth_kwarg__'
+
+
+def _accepts_depth_kwarg(cls):
+    """True if ``cls`` can be constructed with the private ``_depth`` keyword.
+
+    The answer is cached on the class itself. It is only read from the class's
+    own ``__dict__`` so that a subclass overriding ``__init__`` is inspected on
+    its own merits.
+    """
+    try:
+        return cls.__dict__[_DEPTH_KWARG_CACHE_ATTR]
+    except KeyError:
+        pass
+    if cls.__init__ is Packet.__init__:
+        supported = True  # the base constructor pops _depth from **kwargs
+    else:
+        try:
+            params = inspect.signature(cls.__init__).parameters.values()
+        except (TypeError, ValueError):
+            # Uninspectable constructor: behave as before this depth accounting
+            # existed and pass no keyword (the class may still set _depth).
+            supported = False
+        else:
+            supported = any(p.kind == p.VAR_KEYWORD for p in params) or '_depth' in params
+    try:
+        setattr(cls, _DEPTH_KWARG_CACHE_ATTR, supported)
+    except (AttributeError, TypeError):
+        pass  # a class that forbids attributes still works, just uncached
+    return supported
+
+
+def _unpack_payload(pkt, cls, buf):
+    """Construct the encapsulated payload ``cls(buf)`` of ``pkt``.
+
+    Tracks the encapsulation nesting depth and enforces MAX_RECURSION_DEPTH.
+    The EncapsulationDepthError raised here is a dpkt error; the calling
+    decoder must re-raise it rather than fall back to the raw bytes.
+    """
+    depth = _next_depth(pkt)
+    try:
+        if _accepts_depth_kwarg(cls):
+            return cls(buf, _depth=depth)
+        # A protocol parser registered by a third party may have a constructor
+        # without **kwargs; keep it working, it simply does not propagate depth.
+        return cls(buf)
+    except _RECURSION_ERRORS:
+        # A caller with an already-deep stack, or a lowered interpreter
+        # recursion limit, can still exhaust the C stack below our budget.
+        # Report it as the same documented error instead of leaking it.
+        raise EncapsulationDepthError(
+            'maximum encapsulation depth (%d) exceeded' % _depth_limit())
 
 
 # See the "creating parsers" documentation for how all of this works
@@ -155,7 +253,12 @@ class Packet(_MetaPacket("Temp", (object,), {})):
 
         Optional keyword arguments correspond to members to set
         (matching fields in self.__hdr__, or 'data').
+
+        The private keyword argument ``_depth`` tracks how many encapsulation
+        layers have been decoded so far; it is threaded through the protocol
+        constructors and is not exposed as a packet field.
         """
+        self._depth = kwargs.pop('_depth', 0)
         self.data = b''
         if args:
             try:
@@ -520,6 +623,102 @@ def test_unpacking_failure():
 
     with pytest.raises(UnpackError, match="invalid TestPacket: "):
         TestPacket(b'\x00')  # header will unpack successfully
+
+
+def test_encapsulation_depth_error_hierarchy():
+    # a nesting-budget violation is a dpkt parse error, so the usual
+    # ``except dpkt.Error``/``except dpkt.UnpackError`` handlers catch it
+    assert issubclass(EncapsulationDepthError, UnpackError)
+    assert issubclass(EncapsulationDepthError, Error)
+
+
+def test_depth_budget_threading():
+    import pytest
+
+    class Layer(Packet):
+        __hdr__ = (('v', 'B', 0),)
+
+        def unpack(self, buf):
+            Packet.unpack(self, buf)
+            if self.data:
+                self.data = _unpack_payload(self, Layer, self.data)
+
+    # the outermost packet is depth 0, so MAX_RECURSION_DEPTH encapsulated
+    # payloads may follow it: MAX_RECURSION_DEPTH + 1 layers in total
+    buf = b'\x00' * (MAX_RECURSION_DEPTH + 1)
+    pkt = Layer(buf)
+    depth = 0
+    while isinstance(pkt, Packet):
+        depth += 1
+        pkt = pkt.data
+    assert depth == MAX_RECURSION_DEPTH + 1
+
+    # one layer more and the parse ends with the documented dpkt error
+    with pytest.raises(EncapsulationDepthError, match=r'maximum encapsulation depth \(%d\)' % MAX_RECURSION_DEPTH):
+        Layer(b'\x00' * (MAX_RECURSION_DEPTH + 2))
+
+
+def test_depth_budget_accepts_legacy_parsers():
+    # a parser whose constructor has no **kwargs cannot receive _depth; it must
+    # still be constructible from the dispatch path instead of raising TypeError
+    class Legacy(Packet):
+        __hdr__ = (('v', 'B', 0),)
+
+        def __init__(self, buf):
+            Packet.__init__(self, buf)
+
+    pkt = Packet()
+    pkt._depth = 0
+    parsed = _unpack_payload(pkt, Legacy, b'\x07')
+    assert isinstance(parsed, Legacy) and parsed.v == 7
+
+
+def test_depth_attribute_is_private():
+    class Layer(Packet):
+        __hdr__ = (('v', 'B', 0),)
+
+    pkt = Layer(b'\x01')
+    assert pkt._depth == 0
+    # the internal counter must not leak into repr/pprint or the packed bytes
+    assert 'depth' not in repr(pkt)
+    assert bytes(pkt) == b'\x01'
+    # an explicit depth is threaded through as an internal kwarg, not a field
+    assert Layer(b'\x01', _depth=3)._depth == 3
+    assert bytes(Layer(b'\x01', _depth=3)) == b'\x01'
+
+
+def test_depth_limit_is_retunable():
+    # callers may raise the budget for capture files that legitimately nest
+    # deeper than the default; the limit is read at parse time
+    import dpkt
+    import pytest
+
+    class Layer(Packet):
+        __hdr__ = (('v', 'B', 0),)
+
+        def unpack(self, buf):
+            Packet.unpack(self, buf)
+            if self.data:
+                self.data = _unpack_payload(self, Layer, self.data)
+
+    buf = b'\x00' * 100
+    original = dpkt.MAX_RECURSION_DEPTH
+    try:
+        dpkt.MAX_RECURSION_DEPTH = 100
+        assert _count_packet_layers(Layer(buf)) == 100
+        dpkt.MAX_RECURSION_DEPTH = 5
+        with pytest.raises(EncapsulationDepthError, match=r'maximum encapsulation depth \(5\)'):
+            Layer(buf)
+    finally:
+        dpkt.MAX_RECURSION_DEPTH = original
+
+
+def _count_packet_layers(pkt):
+    n = 0
+    while isinstance(pkt, Packet):
+        n += 1
+        pkt = pkt.data
+    return n
 
 
 def test_repr():
