@@ -8,26 +8,58 @@ from . import dpkt
 from .compat import BytesIO, iteritems
 
 
+# Characters that terminate an RFC 7230 token (header field-name) besides
+# whitespace and control characters.
+_TOKEN_SEPARATORS = frozenset('()<>@,;:\\"/[]?={} \t')
+_HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
+_DECIMAL_DIGITS = frozenset('0123456789')
+
+# Trailer fields that control message framing, routing or the connection
+# itself.  They are not allowed in a chunked trailer section (RFC 7230,
+# section 4.1.2) because a parser that honours them could disagree with one
+# that ignores them about the message boundary.
+_FORBIDDEN_TRAILER_FIELDS = frozenset((
+    'content-length', 'transfer-encoding', 'host', 'connection',
+    'keep-alive', 'te', 'trailer', 'upgrade', 'proxy-authorization',
+    'proxy-authenticate', 'content-encoding', 'content-range', 'content-type',
+))
+
+
+def _is_token(s):
+    """Return True if s is a valid RFC 7230 token, e.g. a header field-name."""
+    if not s:
+        return False
+    for ch in s:
+        if ch in _TOKEN_SEPARATORS or ord(ch) < 0x21 or ord(ch) > 0x7e:
+            return False
+    return True
+
+
 def parse_headers(f):
     """Return dict of HTTP headers parsed from a file object."""
     d = OrderedDict()
     while 1:
         # The following logic covers two kinds of loop exit criteria.
         # 1) If the header is valid, when we reached the end of the header,
-        #    f.readline() would return with '\r\n', then after strip(),
-        #    we can break the loop.
+        #    f.readline() would return with '\r\n', then after stripping the
+        #    line terminator, we can break the loop.
         # 2) If this is a weird header, which do not ends with '\r\n',
-        #    f.readline() would return with '', then after strip(),
-        #    we still get an empty string, also break the loop.
-        line = f.readline().strip().decode("ascii", "ignore")
+        #    f.readline() would return with '', also break the loop.
+        raw = f.readline()
+        if not raw:
+            break
+        # Only strip the line terminator: leading whitespace is not allowed in
+        # a header field-name and would otherwise let "Content-Length : 5"
+        # slip through as a header the parser does not recognize.
+        line = raw.rstrip(b'\r\n').decode('latin-1')
         if not line:
             break
         l_ = line.split(':', 1)
-        if len(l_[0].split()) != 1:
+        if len(l_) != 2 or not _is_token(l_[0]):
             raise dpkt.UnpackError('invalid header: %r' % line)
 
         k = l_[0].lower()
-        v = len(l_) != 1 and l_[1].lstrip() or ''
+        v = l_[1].lstrip()
         if k in d:
             if not type(d[k]) is list:
                 d[k] = [d[k]]
@@ -37,47 +69,157 @@ def parse_headers(f):
     return d
 
 
-def parse_body(f, headers):
-    """Return HTTP body parsed from a file object, given HTTP header dict."""
-    if headers.get('transfer-encoding', '').lower() == 'chunked':
-        l_ = []
-        found_end = False
-        while 1:
-            try:
-                sz = f.readline().split(None, 1)[0]
-            except IndexError:
-                raise dpkt.UnpackError('missing chunk size')
-            try:
-                n = int(sz, 16)
-            except ValueError:
-                raise dpkt.UnpackError('invalid chunk size')
+def _header_values(value):
+    """Return the value of a possibly repeated header as a list."""
+    if isinstance(value, list):
+        return value
+    return [value]
 
-            if n == 0:
-                found_end = True
-            buf = f.read(n)
-            if f.readline().strip():
-                break
 
-            if n and len(buf) == n:
-                l_.append(buf)
-            else:
-                # only possible when len(buf) < n, which will happen if the
-                # file object ends before reading a complete file chunk
-                break
-        if not found_end:
+def _parse_content_length(value):
+    """Validate Content-Length header value(s) and return the body length.
+
+    Repeated values are only accepted when they are identical.  Anything
+    ambiguous (conflicting values, signs, spaces or non-digits) is rejected so
+    that two parsers cannot disagree about where the message body ends.
+    """
+    lengths = []
+    for v in _header_values(value):
+        v = v.strip()
+        if not v or any(c not in _DECIMAL_DIGITS for c in v):
+            raise dpkt.UnpackError('invalid content-length: %r' % (v,))
+        try:
+            lengths.append(int(v))
+        except ValueError:
+            # e.g. int-to-str conversion limit for absurdly long values
+            raise dpkt.UnpackError('invalid content-length: %r' % (v,))
+    if lengths.count(lengths[0]) != len(lengths):
+        raise dpkt.UnpackError('conflicting content-length values: %r' % (lengths,))
+    return lengths[0]
+
+
+def _parse_transfer_encoding(value):
+    """Validate Transfer-Encoding header value(s).
+
+    Only a single, final "chunked" coding is accepted; any other value leaves
+    the message boundary undetermined and is therefore rejected.
+    """
+    codings = []
+    for v in _header_values(value):
+        for coding in v.split(','):
+            coding = coding.strip().lower()
+            if not coding:
+                raise dpkt.UnpackError('invalid transfer-encoding: %r' % (value,))
+            codings.append(coding)
+    if codings[-1:] != ['chunked'] or 'chunked' in codings[:-1]:
+        raise dpkt.UnpackError('unsupported transfer-encoding: %r' % (value,))
+
+
+def _parse_chunk_size(line):
+    """Return the size of a chunk from its size line (including extensions)."""
+    text = line.rstrip(b'\r\n')
+    try:
+        size = text.split(b';', 1)[0].decode('ascii')
+    except UnicodeDecodeError:
+        raise dpkt.UnpackError('invalid chunk size: %r' % (text,))
+    if not size:
+        raise dpkt.UnpackError('missing chunk size')
+    if any(c not in _HEX_DIGITS for c in size):
+        raise dpkt.UnpackError('invalid chunk size: %r' % (size,))
+    return int(size, 16)
+
+
+def _read_chunk_terminator(f):
+    """Read and validate the CRLF that terminates a chunk's data."""
+    line = f.readline()
+    if line == b'\r\n':
+        return
+    if not line.endswith(b'\r\n'):
+        raise dpkt.NeedData('premature end of chunked body')
+    raise dpkt.UnpackError('invalid chunk terminator: %r' % (line,))
+
+
+def _read_chunked_trailer(f):
+    """Read and validate the (possibly empty) trailer section of a body."""
+    while 1:
+        line = f.readline()
+        if line == b'\r\n':
+            return
+        if not line.endswith(b'\r\n'):
             raise dpkt.NeedData('premature end of chunked body')
-        body = b''.join(l_)
-    elif 'content-length' in headers:
-        n = int(headers['content-length'])
-        body = f.read(n)
+        trailer = line.rstrip(b'\r\n').decode('latin-1')
+        parts = trailer.split(':', 1)
+        if len(parts) != 2 or not _is_token(parts[0]) or parts[0].lower() in _FORBIDDEN_TRAILER_FIELDS:
+            raise dpkt.UnpackError('invalid trailer: %r' % (trailer,))
+
+
+def _parse_chunked_body(f):
+    """Return the decoded body of a chunked transfer-encoding message."""
+    chunks = []
+    while 1:
+        line = f.readline()
+        if not line:
+            raise dpkt.UnpackError('missing chunk size')
+        if not line.endswith(b'\r\n'):
+            # A size line without its CRLF means the stream was cut short.
+            raise dpkt.NeedData('premature end of chunked body')
+        n = _parse_chunk_size(line)
+        if n == 0:
+            _read_chunked_trailer(f)
+            break
+        try:
+            buf = f.read(n)
+        except (OverflowError, MemoryError):
+            # The declared chunk cannot possibly be present; do not let an
+            # absurd size line exhaust memory.
+            raise dpkt.NeedData('premature end of chunked body')
+        if len(buf) != n:
+            raise dpkt.NeedData('premature end of chunked body')
+        chunks.append(buf)
+        _read_chunk_terminator(f)
+    return b''.join(chunks)
+
+
+def parse_body(f, headers, is_request=False):
+    """Return HTTP body parsed from a file object, given HTTP header dict.
+
+    Message framing is validated strictly so that a proxy and an origin
+    server cannot disagree about the request boundary (request smuggling).
+    Ambiguous framing (conflicting Content-Length, Transfer-Encoding together
+    with Content-Length, malformed chunk sizes or terminators) raises
+    dpkt.UnpackError instead of merging bytes from the next message into this
+    body.
+
+    Requests without Content-Length or Transfer-Encoding carry no body
+    (RFC 7230, section 3.3.3); otherwise the remaining bytes, which may include
+    the next request, would be swallowed as this body.
+    """
+    transfer_encoding = headers.get('transfer-encoding')
+    content_length = headers.get('content-length')
+
+    if transfer_encoding is not None:
+        if content_length is not None:
+            # RFC 7230, section 3.3.3: a message with both headers must be
+            # treated as unrecoverable rather than risking a framing mismatch.
+            raise dpkt.UnpackError('both transfer-encoding and content-length present')
+        _parse_transfer_encoding(transfer_encoding)
+        return _parse_chunked_body(f)
+    elif content_length is not None:
+        n = _parse_content_length(content_length)
+        try:
+            body = f.read(n)
+        except (OverflowError, MemoryError):
+            # The declared body cannot possibly be present.
+            raise dpkt.NeedData('short body (missing %d bytes)' % n)
         if len(body) != n:
             raise dpkt.NeedData('short body (missing %d bytes)' % (n - len(body)))
-    elif 'content-type' in headers:
-        body = f.read()
+        return body
+    elif 'content-type' in headers and not is_request:
+        # Response body delimited by the connection close.
+        return f.read()
     else:
         # XXX - need to handle HTTP/0.9
-        body = b''
-    return body
+        return b''
 
 
 class Message(dpkt.Packet):
@@ -111,13 +253,13 @@ class Message(dpkt.Packet):
             for k, v in iteritems(kwargs):
                 setattr(self, k, v)
 
-    def unpack(self, buf, is_body_allowed=True):
+    def unpack(self, buf, is_body_allowed=True, is_request=False):
         f = BytesIO(buf)
         # Parse headers
         self.headers = parse_headers(f)
         # Parse body
         if is_body_allowed:
-            self.body = parse_body(f, self.headers)
+            self.body = parse_body(f, self.headers, is_request)
         else:
             self.body = b''
         # Save the rest
@@ -192,7 +334,7 @@ class Request(Message):
             self.version = l_[2][len(self.__proto) + 1:]
         self.method = l_[0]
         self.uri = l_[1]
-        Message.unpack(self, f.read())
+        Message.unpack(self, f.read(), is_request=True)
 
     def __str__(self):
         return '%s %s %s/%s\r\n' % (self.method, self.uri, self.__proto,
@@ -592,3 +734,247 @@ def test_parse_body():
     }
     with pytest.raises(dpkt.NeedData, match="premature end of chunked body"):
         parse_body(buf, headers)
+
+
+def test_duplicate_content_length_kept_in_order():
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Host: a\r\n'
+         b'X-Dup: first\r\n'
+         b'X-Dup: second\r\n'
+         b'Content-Length: 5\r\n'
+         b'Content-Length: 5\r\n'
+         b'\r\n'
+         b'helloGET /next HTTP/1.1\r\n\r\n')
+    r = Request(s)
+    assert r.body == b'hello'
+    # the next request starts where the buffer says it does
+    assert r.data == b'GET /next HTTP/1.1\r\n\r\n'
+    # duplicate headers are preserved in their original order
+    assert r.headers['x-dup'] == ['first', 'second']
+    assert r.headers['content-length'] == ['5', '5']
+
+
+def test_conflicting_content_length_rejected():
+    import pytest
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Content-Length: 5\r\n'
+         b'Content-Length: 6\r\n'
+         b'\r\n'
+         b'helloGET /next HTTP/1.1\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="conflicting content-length values: .*5, 6"):
+        Request(s)
+
+    # a body is still rejected when the values are split across a list
+    from .compat import BytesIO
+    buf = BytesIO(b'helloGET /next HTTP/1.1\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="conflicting content-length values"):
+        parse_body(buf, {'content-length': ['5', '6']})
+
+
+def test_transfer_encoding_with_content_length_rejected():
+    import pytest
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'Content-Length: 5\r\n'
+         b'\r\n'
+         b'0\r\n'
+         b'\r\n'
+         b'GET /next HTTP/1.1\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="both transfer-encoding and content-length present"):
+        Request(s)
+
+
+def test_invalid_transfer_encoding_rejected():
+    import pytest
+    for te in (b'identity', b'gzip', b'chunked, chunked', b'', b'chunkedx'):
+        s = b'POST / HTTP/1.1\r\nTransfer-Encoding: ' + te + b'\r\n\r\n0\r\n\r\n'
+        with pytest.raises(dpkt.UnpackError, match="transfer-encoding"):
+            Request(s)
+
+    # only a single final "chunked" coding is supported
+    s = b'POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n'
+    r = Request(s)
+    assert r.body == b''
+
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n0\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="transfer-encoding"):
+        Request(s)
+
+
+def test_negative_and_signless_content_length_rejected():
+    import pytest
+    for cl in (b'-5', b'+5', b'--5', b'5.0', b'0x5', b'', b'5 5', b'5,5'):
+        s = (b'POST / HTTP/1.1\r\n'
+             b'Content-Length: ' + cl + b'\r\n'
+             b'\r\n'
+             b'helloGET /next HTTP/1.1\r\n\r\n')
+        with pytest.raises(dpkt.UnpackError, match="(invalid|conflicting) content-length"):
+            Request(s)
+
+
+def test_header_name_with_whitespace_rejected():
+    import pytest
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Content-Length : 5\r\n'
+         b'\r\n'
+         b'helloGET /next HTTP/1.1\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="invalid header"):
+        Request(s)
+
+    # obsolete line folding must not be able to append to a header value
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Content-Length: 5\r\n'
+         b' 5\r\n'
+         b'\r\n'
+         b'helloGET /next HTTP/1.1\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="invalid header"):
+        Request(s)
+
+
+def test_invalid_chunk_size_rejected():
+    import pytest
+    for size in (b'-5', b'+5', b'0x5', b'5.5', b'5 0', b'zz'):
+        s = (b'POST / HTTP/1.1\r\n'
+             b'Transfer-Encoding: chunked\r\n'
+             b'\r\n' + size + b'\r\n'
+             b'hello\r\n'
+             b'0\r\n\r\n'
+             b'GET /next HTTP/1.1\r\n\r\n')
+        with pytest.raises(dpkt.UnpackError, match="invalid chunk size"):
+            Request(s)
+
+
+def test_absurd_chunk_size_rejected():
+    import pytest
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n'
+         b'ffffffffffffffff\r\n'
+         b'x')
+    with pytest.raises(dpkt.NeedData, match="premature end of chunked body"):
+        Request(s)
+
+
+def test_chunk_terminator_required():
+    import pytest
+    # chunk data not followed by CRLF: the rest of the buffer does not become
+    # part of the body.
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n'
+         b'5\r\n'
+         b'helloXX'
+         b'0\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="invalid chunk terminator"):
+        Request(s)
+
+    # chunk data cut by the end of the stream
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n'
+         b'5\r\n'
+         b'hello')
+    with pytest.raises(dpkt.NeedData, match="premature end of chunked body"):
+        Request(s)
+
+
+def test_chunked_message_terminator_required():
+    import pytest
+    # no CRLF after the last chunk: the next request must not be mistaken
+    # for a trailer.
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n'
+         b'5\r\n'
+         b'hello\r\n'
+         b'0\r\n'
+         b'GET /next HTTP/1.1\r\n'
+         b'Host: b\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="invalid trailer"):
+        Request(s)
+
+    # truncated trailer section
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n'
+         b'0\r\n'
+         b'X-Trailer: value')
+    with pytest.raises(dpkt.NeedData, match="premature end of chunked body"):
+        Request(s)
+
+    # framing headers may not be smuggled through the trailer section
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n'
+         b'0\r\n'
+         b'Content-Length: 5\r\n'
+         b'\r\n')
+    with pytest.raises(dpkt.UnpackError, match="invalid trailer"):
+        Request(s)
+
+
+def test_valid_chunked_request_boundary_preserved():
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'\r\n'
+         b'5;ext=1\r\n'
+         b'hello\r\n'
+         b'6\r\n'
+         b' world\r\n'
+         b'0\r\n'
+         b'X-Trailer: value\r\n'
+         b'\r\n'
+         b'GET /next HTTP/1.1\r\n'
+         b'Host: b\r\n\r\n')
+    r = Request(s)
+    assert r.body == b'hello world'
+    assert r.data == b'GET /next HTTP/1.1\r\nHost: b\r\n\r\n'
+    assert list(r.headers) == ['transfer-encoding']
+
+
+def test_valid_content_length_request_boundary_preserved():
+    s = (b'POST / HTTP/1.1\r\n'
+         b'Content-Length: 5\r\n'
+         b'\r\n'
+         b'hello'
+         b'GET /next HTTP/1.1\r\n'
+         b'Host: b\r\n\r\n')
+    r = Request(s)
+    assert r.body == b'hello'
+    assert r.data == b'GET /next HTTP/1.1\r\nHost: b\r\n\r\n'
+
+
+def test_request_without_framing_headers_has_empty_body():
+    # RFC 7230, section 3.3.3: a request without Content-Length or
+    # Transfer-Encoding has no body, so the following request must not be
+    # swallowed as body bytes.
+    s = (b'GET /a HTTP/1.1\r\n'
+         b'Content-Type: text/plain\r\n'
+         b'\r\n'
+         b'GET /b HTTP/1.1\r\n'
+         b'Host: example\r\n\r\n')
+    r = Request(s)
+    assert r.body == b''
+    assert r.data == b'GET /b HTTP/1.1\r\nHost: example\r\n\r\n'
+
+    # responses may still be delimited by the connection close
+    s = (b'HTTP/1.0 200 OK\r\n'
+         b'Content-Type: text/plain\r\n'
+         b'\r\n'
+         b'hello')
+    r = Response(s)
+    assert r.body == b'hello'
+
+
+def test_duplicate_te_cl_rejected_on_response():
+    import pytest
+    s = (b'HTTP/1.1 200 OK\r\n'
+         b'Transfer-Encoding: chunked\r\n'
+         b'Content-Length: 5\r\n'
+         b'\r\n'
+         b'0\r\n\r\n')
+    with pytest.raises(dpkt.UnpackError, match="both transfer-encoding and content-length present"):
+        Response(s)
