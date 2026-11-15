@@ -195,6 +195,70 @@ the IP parser overrides `__bytes__` to calculate the IP checksum prior
 to packing, and insert `bytes(self.opts)` between the packed header and
 data.
 
+### Decoding nested layers: distinguishable failure results
+
+A layered parser (Ethernet, IP, IP6, LLC, PPP/PPPoE, SLL/SLL2, GRE, AH,
+ICMP/ICMP6, AOE, SCCP, ...) hands its payload to the decoder registered
+for the type/proto number in its header. Two very different things can go
+wrong, and dpkt keeps them distinguishable instead of turning every
+failure into bare, unexplained bytes:
+
+* **Unknown protocol** - no decoder is registered for the type/proto
+  number. The payload itself is not claimed to be invalid. This is
+  reported with `dpkt.UnknownProtocolError`.
+* **Malformed payload of a *known* protocol** - a decoder was selected
+  (the protocol was recognized) but it rejected the bytes because they
+  were truncated or contained malformed fields. This is reported with
+  `dpkt.InnerPacketUnpackError`, which preserves the failing layer
+  (`.layer`), the type id (`.type_id`), the decoder that was selected
+  (`.protocol_name`) and the original exception from that decoder
+  (`.inner_error`, also available as `.reason`).
+
+Both are subclasses of `dpkt.DecodeError` (itself an `UnpackError`). They
+are recorded on the packet rather than raised, because the outer header
+was parsed successfully. Read them through the `unpack_error` property;
+it is `None` when the payload decoded cleanly:
+
+```python
+eth = dpkt.ethernet.Ethernet(frame)
+if eth.unpack_error is None:
+    handle(eth.data)                       # a decoded inner Packet
+elif isinstance(eth.unpack_error, dpkt.UnknownProtocolError):
+    raw = eth.data                         # unrecognized protocol, raw bytes
+elif isinstance(eth.unpack_error, dpkt.InnerPacketUnpackError):
+    err = eth.unpack_error
+    log(err.protocol_name, err.reason)     # recognized protocol, bad payload
+    raw = eth.data                         # the malformed bytes, still present
+```
+
+Important compatibility and safety guarantees:
+
+* Default access is unchanged. A successfully decoded packet still
+  exposes its inner layer both as `data` and through the named attribute
+  (e.g. `eth.ip`), and on any failure `data` still holds the raw payload
+  exactly as it did before.
+* A failure never disguises malformed data as an unknown protocol. The
+  outer header's type id decides which case applies, and the concrete
+  reason from the inner decoder is always retained on
+  `InnerPacketUnpackError.inner_error`.
+* Only a failure in the *payload* layer is recorded. A failure while
+  parsing the packet's own header (for example a truncated outer header)
+  still raises `NeedData`/`UnpackError` from the constructor as before.
+
+When implementing a parser, use the shared `Packet._unpack_inner()`
+helper instead of writing a `try/except (KeyError, UnpackError)` block.
+It performs the dispatch, records the right `DecodeError` subclass, keeps
+the raw payload in `data`, and sets the named inner attribute on success:
+
+```python
+def unpack(self, buf):
+    dpkt.Packet.unpack(self, buf)
+    self._unpack_inner(
+        lambda: self._typesw[self.type],  # raises KeyError if unknown
+        self.data,                        # raw payload to decode
+        self.type)                        # type id kept on the error
+```
+
 ### \_\_len\_\_
 
 `__len__()` returns the size of the serialized packet and is typically

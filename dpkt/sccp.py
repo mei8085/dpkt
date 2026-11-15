@@ -220,10 +220,24 @@ class SCCP(dpkt.Packet):
             raise dpkt.NeedData('not enough data')
         self.msg, self.data = self.data[:n], self.data[n:]
         try:
-            p = self._msgsw[self.msgid](self.msg)
-            setattr(self, p.__class__.__name__.lower(), p)
-        except (KeyError, dpkt.UnpackError):
-            pass
+            msg_cls = self._msgsw[self.msgid]
+        except KeyError:
+            # unknown SCCP message type: keep self.msg raw and record it
+            self._record_unpack_error(
+                dpkt.UnknownProtocolError(self.__class__, self.msgid),
+                self.msgid)
+            return
+        try:
+            p = msg_cls(self.msg)
+        except dpkt.UnpackError as e:
+            # recognized message type but malformed/truncated contents
+            self._record_unpack_error(
+                dpkt.InnerPacketUnpackError(
+                    self.__class__, e, type_id=self.msgid,
+                    protocol_name=msg_cls.__name__),
+                self.msgid)
+            return
+        setattr(self, p.__class__.__name__.lower(), p)
 
 
 def test_sccp():
@@ -264,3 +278,42 @@ def test_sccp():
     sccp = SCCP(buf)
     assert sccp.msg == b'\xab\xcd\xef\x01'
     assert sccp.data == b''
+
+
+def test_sccp_unknown_msgid_is_distinguishable():
+    from binascii import unhexlify
+
+    # unregistered msgid 0xbeef -> unknown protocol; msg/data split preserved
+    buf = unhexlify(
+        '08000000'  # len
+        '00000000'  # rsvd
+        'efbe0000'  # msgid (unregistered)
+        'abcdef01'  # msg
+    )
+    sccp = SCCP(buf)
+    err = sccp.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.type_id == 0xbeef
+    assert sccp.msg == b'\xab\xcd\xef\x01'
+    assert sccp.data == b''
+
+
+def test_sccp_malformed_known_msg_keeps_reason():
+    from binascii import unhexlify
+
+    # SET_LAMP (0x86) is recognized but SetLamp needs 8 bytes; 4 -> NeedData
+    buf = unhexlify(
+        '08000000'  # len
+        '00000000'  # rsvd
+        '86000000'  # msgid (SET_LAMP)
+        'abcdef01'  # truncated msg
+    )
+    sccp = SCCP(buf)
+    err = sccp.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'SetLamp'
+    assert isinstance(err.inner_error, dpkt.NeedData)
+    # the malformed message bytes are retained, not silently dropped
+    assert sccp.msg == b'\xab\xcd\xef\x01'

@@ -45,11 +45,8 @@ class AOE(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        try:
-            self.data = self._cmdsw[self.cmd](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, struct.error, dpkt.UnpackError):
-            pass
+        self._unpack_inner(
+            lambda: self._cmdsw[self.cmd], self.data, self.cmd)
 
 
 AOE_CMD_ATA = 0
@@ -146,3 +143,37 @@ def test_cmd_loading():
     _mod_init()
     # check that the same modules were loaded, ignoring the fail
     assert AOE._cmdsw == standard_cmds
+
+
+def test_aoe_unknown_cmd_is_unknown_protocol():
+    from binascii import unhexlify
+
+    aoe = AOE(unhexlify(
+        '1000000000'   # fixed header
+        '77'           # unregistered cmd
+        '00000000'     # tag
+        'ab'           # payload
+    ))
+    err = aoe.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.type_id == 0x77
+    assert aoe.data == b'\xab'
+
+
+def test_aoe_malformed_known_cmd_keeps_reason():
+    from binascii import unhexlify
+
+    # cmd 0 = AOE_CMD_ATA; AOEATA needs 12 header bytes but only 4 given
+    aoe = AOE(unhexlify(
+        '1000000000'
+        '00'
+        '00000000'
+        'deadbeef'
+    ))
+    err = aoe.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'AOEATA'
+    assert isinstance(err.inner_error, dpkt.UnpackError)
+    assert aoe.data == b'\xde\xad\xbe\xef'

@@ -50,13 +50,20 @@ class PPPoE(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
+        raw = self.data
         try:
             if self.code == 0:
                 # We need to use the pppoe.PPP header here, because PPPoE
                 # doesn't do the normal encapsulation.
                 self.data = self.ppp = PPP(self.data)
-        except dpkt.UnpackError:
-            pass
+        except dpkt.UnpackError as e:
+            # the PPP layer was recognized but its contents were truncated or
+            # malformed; keep the raw payload and record why instead of hiding
+            # the failure behind bare bytes
+            self.data = raw
+            self._record_unpack_error(
+                dpkt.InnerPacketUnpackError(
+                    self.__class__, e, protocol_name=PPP.__name__))
 
 
 class PPP(ppp.PPP):
@@ -74,11 +81,8 @@ class PPP(ppp.PPP):
             except struct.error:
                 raise dpkt.NeedData
             self.data = self.data[1:]
-        try:
-            self.data = self._protosw[self.p](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, struct.error, dpkt.UnpackError):
-            pass
+        self._unpack_inner(
+            lambda: self._protosw[self.p], self.data, self.p)
 
     def pack_hdr(self):
         try:
@@ -194,3 +198,36 @@ def test_ppp_pack_hdr():
 
 
 # XXX - TODO TLVs, etc.
+
+
+def test_pppoe_inner_unknown_proto_recorded_on_ppp():
+    # session frame whose inner PPP uses an unregistered protocol number
+    p = PPPoE(b'\x11\x00\x00\x00\x00\x03\x00' + b'abc')
+    # the outer PPPoE header parsed fine...
+    assert p.unpack_error is None
+    # ...the failure is recorded at the layer where it happened (the PPP)
+    err = p.ppp.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+
+
+def test_pppoe_inner_malformed_known_proto_keeps_reason():
+    # inner PPP selects IP (0x21) but the IP header is truncated
+    p = PPPoE(b'\x11\x00\x00\x00\x00\x04\x21' + b'\x45\x00\x00')
+    err = p.ppp.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'IP'
+    assert isinstance(err.inner_error, dpkt.NeedData)
+
+
+def test_pppoe_header_failure_recorded_by_outer_layer():
+    # truncated compressed PPP header raises NeedData out of the inner PPP;
+    # the outer PPPoE records it instead of swallowing it silently
+    p = PPPoE(b'\x11\x00\x00\x00\x00\x01\x00')
+    err = p.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.protocol_name == 'PPP'
+    assert isinstance(err.inner_error, dpkt.NeedData)
+    # the raw bytes are preserved
+    assert p.data == b'\x00'

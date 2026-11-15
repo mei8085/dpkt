@@ -120,11 +120,13 @@ class IP(dpkt.Packet):
             buf = buf[self.__hdr_len__ + ol:self.len]
         else:  # very likely due to TCP segmentation offload
             buf = buf[self.__hdr_len__ + ol:]
-        try:
-            self.data = self._protosw[self.p](buf) if self.offset == 0 else buf
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
+        if self.offset != 0:
+            # fragmented datagram: the transport header is not present, keep
+            # the raw fragment bytes without attempting to decode them
             self.data = buf
+            return
+        self._unpack_inner(
+            lambda: self._protosw[self.p], buf, self.p)
 
     @classmethod
     def set_proto(cls, p, pktclass):
@@ -502,3 +504,44 @@ def test_default_udp_checksum():
 def test_get_proto_name():
     assert get_ip_proto_name(6) == 'TCP'
     assert get_ip_proto_name(999) is None
+
+
+def test_ip_unknown_proto_is_unknown_not_parse_error():
+    """Unregistered IP protocol number -> UnknownProtocolError, raw data kept."""
+    payload = b'\x01\x02\x03'
+    # proto 0xfd (253) is not registered; len covers 20-byte hdr + payload
+    buf = (b'E\x00\x00\x17\x00\x00\x00\x00@\xfd\x00\x00'
+           b'\x01\x02\x03\x04\x05\x06\x07\x08' + payload)
+    pkt = IP(buf)
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.layer is IP
+    assert err.type_id == 0xfd
+    assert pkt.data == payload
+
+
+def test_ip_malformed_known_proto_keeps_failure_layer_and_reason():
+    """Proto 6 (TCP) recognized but the segment is truncated."""
+    bad_tcp = b'\x00\x00\x00\x00'  # TCP needs a 20-byte header
+    buf = (b'E\x00\x00\x18\x00\x00\x00\x00@\x06\x00\x00'
+           b'\x01\x02\x03\x04\x05\x06\x07\x08' + bad_tcp)
+    pkt = IP(buf)
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.layer is IP
+    assert err.type_id == IP_PROTO_TCP
+    assert err.protocol_name == 'TCP'
+    assert isinstance(err.inner_error, dpkt.NeedData)
+    # malformed payload remains reachable instead of being hidden
+    assert pkt.data == bad_tcp
+    assert not hasattr(pkt, 'tcp')
+
+
+def test_ip_normal_decode_has_no_error():
+    from . import udp
+    s = b'E\x00\x00"\x00\x00\x00\x00@\x11r\xc0\x01\x02\x03\x04\x01\x02\x03\x04\x00o\x00\xde\x00\x0e\xbf5foobar'
+    pkt = IP(s)
+    assert pkt.unpack_error is None
+    assert isinstance(pkt.data, udp.UDP)

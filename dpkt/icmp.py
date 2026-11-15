@@ -124,11 +124,8 @@ class ICMP(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        try:
-            self.data = self._typesw[self.type](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            pass
+        self._unpack_inner(
+            lambda: self._typesw[self.type], self.data, self.type)
 
     def __bytes__(self):
         if not self.sum:
@@ -188,3 +185,25 @@ def test_invalid_data():
 
     # no additional attributes have been added due to the type being invalid
     assert dir(icmp) == dir(ICMP())
+
+
+def test_icmp_unknown_type_is_unknown_protocol():
+    # type 99 has no entry in _typesw -> unknown, raw payload kept
+    pkt = ICMP(b'\x63\x00\x00\x00' + b'data')
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.type_id == 99
+    assert pkt.data == b'data'
+
+
+def test_icmp_malformed_known_type_keeps_reason():
+    from binascii import unhexlify
+
+    # type 3 (Unreach) is recognized; its embedded IP quote is truncated
+    pkt = ICMP(unhexlify('03000000' '0000' '0000') + b'\x45\x00')
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'Unreach'
+    assert isinstance(err.inner_error, dpkt.UnpackError)

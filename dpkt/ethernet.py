@@ -129,12 +129,9 @@ class Ethernet(dpkt.Packet):
                     buf = buf[4:]  # skip the ECW
                 self._next_type = ETH_TYPE_TEB  # re-use TEB class mapping to decode Ethernet
 
-        try:
-            eth_type = self._next_type or self.type
-            self.data = self._typesw[eth_type](buf)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            self.data = buf
+        eth_type = self._next_type or self.type
+        self._unpack_inner(
+            lambda: self._typesw[eth_type], buf, eth_type)
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
@@ -873,3 +870,60 @@ def test_eth_novell():
     assert isinstance(eth.data, dpkt.ipx.IPX)
     assert eth.data.tc == 2
     assert eth.data.data == b''
+
+
+def test_eth_unknown_ethertype_is_distinguishable():
+    """An unregistered ethertype is an unknown protocol, not a parse failure."""
+    payload = b'\xde\xad\xbe\xef raw payload'
+    frame = b'\x00' * 12 + b'\x99\x99' + payload
+    eth = Ethernet(frame)
+
+    err = eth.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.layer is Ethernet
+    assert err.type_id == 0x9999
+    assert eth._unpack_unknown_type == 0x9999
+    # legacy access: raw payload still handed back untouched
+    assert eth.data == payload
+    assert isinstance(eth.data, bytes)
+    assert bytes(eth) == frame
+
+
+def test_eth_malformed_known_protocol_records_layer_and_reason():
+    """Ethertype 0x0800 (IP) selected, but the IP payload is truncated."""
+    from . import ip
+
+    truncated_ip = b'\x45\x00\x00\x14\x00\x00\x00'  # 7 < 20 byte IP header
+    frame = b'\x00' * 12 + b'\x08\x00' + truncated_ip
+    eth = Ethernet(frame)
+
+    err = eth.unpack_error
+    # the protocol WAS recognized, so this must not be an unknown-protocol error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.layer is Ethernet
+    assert err.type_id == ETH_TYPE_IP
+    assert err.protocol_name == ip.IP.__name__
+    # the concrete failure reason from the decoder is preserved
+    assert isinstance(err.inner_error, dpkt.NeedData)
+    assert 'needed at least' in str(err.inner_error)
+    # the attacker-supplied malformed bytes are still reachable, not swallowed
+    assert eth.data == truncated_ip
+    assert bytes(eth) == frame
+
+
+def test_eth_normal_packet_has_no_unpack_error():
+    from . import ip6
+    from . import tcp
+    s = (b'\x00\xb0\xd0\xe1\x80\x72\x00\x11\x24\x8c\x11\xde\x86\xdd\x60\x00\x00\x00'
+         b'\x00\x28\x06\x40\xfe\x80\x00\x00\x00\x00\x00\x00\x02\x11\x24\xff\xfe\x8c'
+         b'\x11\xde\xfe\x80\x00\x00\x00\x00\x00\x00\x02\xb0\xd0\xff\xfe\xe1\x80\x72'
+         b'\xcd\xd3\x00\x16\xff\x50\xd7\x13\x00\x00\x00\x00\xa0\x02\xff\xff\x67\xd3'
+         b'\x00\x00\x02\x04\x05\xa0\x01\x03\x03\x00\x01\x01\x08\x0a\x7d\x18\x3a\x61'
+         b'\x00\x00\x00\x00')
+    eth = Ethernet(s)
+    assert eth.unpack_error is None
+    assert isinstance(eth.data, ip6.IP6)
+    assert isinstance(eth.data.data, tcp.TCP)
+    assert eth.data.unpack_error is None

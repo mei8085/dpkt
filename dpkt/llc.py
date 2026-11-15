@@ -36,12 +36,10 @@ class LLC(dpkt.Packet):
         dpkt.Packet.unpack(self, buf)
         if self.is_snap:
             self.oui, self.type = struct.unpack('>IH', b'\x00' + self.data[:5])
-            self.data = self.data[5:]
-            try:
-                self.data = Ethernet.get_type(self.type)(self.data)
-                setattr(self, self.data.__class__.__name__.lower(), self.data)
-            except (KeyError, dpkt.UnpackError):
-                pass
+            payload = self.data[5:]
+            self.data = payload
+            self._unpack_inner(
+                lambda: Ethernet.get_type(self.type), payload, self.type)
         else:
             # non-SNAP
             if self.dsap == 0x06:  # SAP_IP
@@ -155,3 +153,26 @@ def test_pack_hdr_invalid_class():
         '22'       # data in test class header
     )
     assert bytes(llc) == correct
+
+
+def test_llc_snap_unknown_type_records_error():
+    from binascii import unhexlify
+
+    llc = LLC(unhexlify('aaaa03' '111111' '2222'))
+    err = llc.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert err.type_id == 0x2222
+
+
+def test_llc_snap_malformed_known_type_keeps_reason():
+    from binascii import unhexlify
+
+    # SNAP ethertype 0x0800 (IP) selected, but the IP payload is truncated
+    buf = unhexlify('aaaa03' '000000' '0800') + b'\x45\x00\x00'
+    llc = LLC(buf)
+    err = llc.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'IP'
+    assert isinstance(err.inner_error, dpkt.UnpackError)
+    assert llc.data == b'\x45\x00\x00'

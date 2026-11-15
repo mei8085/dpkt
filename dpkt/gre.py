@@ -103,12 +103,8 @@ class GRE(dpkt.Packet):
                 if not sre.len:
                     break
             self.sre = l_
-        try:
-            self.data = ethernet.Ethernet._typesw[self.p](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            # data already set
-            pass
+        self._unpack_inner(
+            lambda: ethernet.Ethernet._typesw[self.p], self.data, self.p)
 
     def __len__(self):
         opt_fmtlen = struct.calcsize(''.join(self.opt_fields_fmts()[1]))
@@ -245,3 +241,21 @@ def test_gre_next_layer():
     assert gre.data.dst == unhexlify('0102030405060708090a0b0c')
     assert len(gre) == len(buf)
     assert bytes(gre) == buf
+
+
+def test_gre_unknown_vs_malformed():
+    from binascii import unhexlify
+
+    # unregistered protocol 0x9999 -> unknown, raw payload kept
+    g = GRE(unhexlify('0000' '9999') + b'xx')
+    assert isinstance(g.unpack_error, dpkt.UnknownProtocolError)
+    assert g.unpack_error.type_id == 0x9999
+    assert g.data == b'xx'
+
+    # protocol 0x0800 (IP) recognized but the IP header is truncated
+    g = GRE(unhexlify('0000' '0800') + b'\x45\x00\x00')
+    err = g.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'IP'
+    assert isinstance(err.inner_error, dpkt.UnpackError)

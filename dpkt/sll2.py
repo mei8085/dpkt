@@ -29,11 +29,8 @@ class SLL2(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        try:
-            self.data = self._typesw[self.ethtype](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            pass
+        self._unpack_inner(
+            lambda: self._typesw[self.ethtype], self.data, self.ethtype)
 
 
 def test_sll2():
@@ -52,3 +49,31 @@ def test_sll2():
     sll2data2 = (b'\x12\x34\x00\x00\x00\x00\x00\x03\x00\x01\x00\x06\x00\x0b\xdb\x52\x0e\x08\xf6\x7f'
                 b'\x45\x00\x00\x34\xcc\x6c\x40\x00\x40\x06\x74\x08\x82\xd9\xfa\x8e\x82\xd9\xfa\x0d')
     sll2test2 = SLL2(sll2data2)
+
+
+def test_sll2_unknown_vs_malformed():
+    from dpkt import dpkt
+
+    # SLL2 header is 20 bytes: ethtype(2) mbz(2) intindex(4) hrd(2)
+    #                          type(1) hlen(1) hdr(8)
+    sll2_hdr = (b'\x12\x34'   # ethtype (unregistered below)
+                b'\x00\x00'   # mbz
+                b'\x03\x00\x00\x00'  # intindex
+                b'\x01\x00'   # hrd
+                b'\x00\x06'   # type, hlen
+                b'\xdb\x52\x0e\x08\x00\x00\x00\x00')  # hdr (8)
+    pkt = SLL2(sll2_hdr + b'payload')
+    assert isinstance(pkt.unpack_error, dpkt.UnknownProtocolError)
+    assert pkt.unpack_error.type_id == 0x1234
+    assert pkt.data == b'payload'
+
+    # ethtype 0x0800 (IP) selected, IP header truncated
+    bad_ip = b'\x45\x00\x00'
+    hdr_ip = b'\x08\x00' + sll2_hdr[2:]
+    pkt2 = SLL2(hdr_ip + bad_ip)
+    err = pkt2.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'IP'
+    assert isinstance(err.inner_error, dpkt.UnpackError)
+    assert pkt2.data == bad_ip

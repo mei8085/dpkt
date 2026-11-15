@@ -97,11 +97,8 @@ class IP6(dpkt.Packet):
             self.data = buf
             return
 
-        try:
-            self.data = self._protosw[next_ext_hdr](buf)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            self.data = buf
+        self._unpack_inner(
+            lambda: self._protosw[next_ext_hdr], buf, next_ext_hdr)
 
     def headers_str(self):
         nxt = self.nxt
@@ -587,3 +584,28 @@ def test_ip6_fragment_no_decode():  # https://github.com/kbandla/dpkt/issues/575
 
     # test packing
     assert bytes(frag2) == s
+
+
+def test_ip6_unknown_next_header():
+    payload = b'xyz'
+    hdr = (b'\x60\x00\x00\x00' + bytes([len(payload)]) + b'\x00' +
+           b'\xfd' + b'\x40' + b'\x11' * 16 + b'\x22' * 16)
+    pkt = IP6(hdr + payload)
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.type_id == 0xfd
+    assert pkt.data == payload
+
+
+def test_ip6_malformed_known_next_header():
+    bad_tcp = b'\x00\x00\x00\x00'  # TCP needs 20 bytes
+    hdr = (b'\x60\x00\x00\x00' + bytes([len(bad_tcp)]) + b'\x00' +
+           b'\x06' + b'\x40' + b'\x11' * 16 + b'\x22' * 16)
+    pkt = IP6(hdr + bad_tcp)
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'TCP'
+    assert isinstance(err.inner_error, dpkt.NeedData)
+    assert pkt.data == bad_tcp

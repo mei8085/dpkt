@@ -34,11 +34,8 @@ class AH(dpkt.Packet):
         self.auth = self.data[:auth_len]
         buf = self.data[auth_len:]
 
-        try:
-            self.data = ip.IP.get_proto(self.nxt)(buf)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            self.data = buf
+        self._unpack_inner(
+            lambda: ip.IP.get_proto(self.nxt), buf, self.nxt)
 
     def __len__(self):
         return self.__hdr_len__ + len(self.auth) + len(self.data)
@@ -84,3 +81,22 @@ def test_creation_from_buf():
     assert isinstance(ah_not_ip.data, bytes)
     assert len(ah_not_ip) == 46
     assert bytes(ah_not_ip) == buf_not_ip
+
+
+def test_ah_unknown_vs_malformed():
+    from binascii import unhexlify
+
+    # unregistered next-header 0x37 -> unknown protocol, raw payload kept
+    ah_unknown = AH(b'\x37' + b'\x00' * 11 + b'xx')
+    err = ah_unknown.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert err.type_id == 0x37
+    assert ah_unknown.data == b'xx'
+
+    # next-header 4 (IP) recognized, IP header truncated
+    ah_bad = AH(b'\x04' + b'\x00' * 11 + b'\x45\x00\x00')
+    err = ah_bad.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'IP'
+    assert isinstance(err.inner_error, dpkt.UnpackError)

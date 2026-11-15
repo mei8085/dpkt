@@ -30,6 +30,87 @@ class PackError(Error):
     pass
 
 
+class DecodeError(UnpackError):
+    """Base class for failures recorded while decoding an inner (payload) layer.
+
+    A decode failure is *not* raised by the outer packet: the outer header was
+    parsed successfully, so construction completes and the raw payload stays
+    available through ``packet.data``. The failure is instead attached to the
+    packet and can be inspected through :attr:`Packet.unpack_error`.
+
+    Two mutually exclusive situations are distinguishable:
+
+    * :class:`UnknownProtocolError` - the next-layer protocol could not be
+      identified because no decoder is registered for its type/proto number.
+      Nothing was wrong with the bytes themselves.
+    * :class:`InnerPacketUnpackError` - the protocol *was* identified and a
+      decoder was selected, but the decoder rejected the payload (truncation,
+      malformed fields, ...). The original exception is kept as ``__cause__``
+      and on :attr:`inner_error` so the failing layer and the reason survive.
+
+    Attributes:
+        layer: class of the packet whose payload could not be decoded.
+        type_id: protocol/type/proto number the outer header pointed at
+                 (``None`` when not applicable).
+        protocol_name: name of the decoder class that was selected, or
+                 ``None`` when the protocol was unknown.
+    """
+
+    def __init__(self, layer, type_id=None, protocol_name=None, message=''):
+        self.layer = layer
+        self.type_id = type_id
+        self.protocol_name = protocol_name
+        if not message:
+            message = self._default_message()
+        super(DecodeError, self).__init__(message)
+
+    def _default_message(self):
+        return '%s: payload decode failure' % self.layer.__name__
+
+
+class UnknownProtocolError(DecodeError):
+    """No decoder is registered for the next-layer protocol identifier.
+
+    The payload bytes are not necessarily invalid; dpkt simply does not know
+    how to interpret them, so the raw payload is returned in ``packet.data``.
+    """
+
+    def __init__(self, layer, type_id=None, message=''):
+        super(UnknownProtocolError, self).__init__(
+            layer, type_id=type_id, protocol_name=None, message=message)
+
+    def _default_message(self):
+        if self.type_id is None:
+            return '%s: unknown payload protocol' % self.layer.__name__
+        return '%s: unknown payload protocol 0x%x' % (
+            self.layer.__name__, self.type_id)
+
+
+class InnerPacketUnpackError(DecodeError):
+    """The next-layer protocol was recognized but its payload failed to parse.
+
+    This is the dangerous case: the bytes claimed to be a known protocol but
+    were truncated or contained malformed fields. The original exception is
+    preserved on :attr:`inner_error` (and as the chained ``__cause__``) so the
+    failing layer and the concrete reason are never silently lost.
+    """
+
+    def __init__(self, layer, inner_error, type_id=None, protocol_name=None):
+        self.inner_error = inner_error
+        message = '%s: %s payload could not be unpacked: %s' % (
+            layer.__name__,
+            protocol_name or 'inner',
+            inner_error)
+        super(InnerPacketUnpackError, self).__init__(
+            layer, type_id=type_id, protocol_name=protocol_name,
+            message=message)
+
+    @property
+    def reason(self):
+        """The underlying parse error from the decoder that rejected the payload."""
+        return self.inner_error
+
+
 # See the "creating parsers" documentation for how all of this works
 
 
@@ -157,6 +238,12 @@ class Packet(_MetaPacket("Temp", (object,), {})):
         (matching fields in self.__hdr__, or 'data').
         """
         self.data = b''
+        # failure (if any) recorded while decoding the payload layer;
+        # None means the payload decoded cleanly (or there is no payload)
+        self._unpack_error = None
+        # the protocol/type/proto number the outer header pointed at when the
+        # payload could not be decoded; None otherwise
+        self._unpack_unknown_type = None
         if args:
             try:
                 self.unpack(args[0])
@@ -198,6 +285,107 @@ class Packet(_MetaPacket("Temp", (object,), {})):
             return bool(self.__getitem__(kls))
         except KeyError:
             return False
+
+    @property
+    def unpack_error(self):
+        """Decode failure recorded for the payload layer, or ``None``.
+
+        ``None`` means the payload decoded as a known protocol (or there is no
+        payload). When the payload could not be decoded this is one of:
+
+        * :class:`UnknownProtocolError` - no decoder is registered for the
+          next-layer protocol identifier; the raw, untouched payload is still
+          available via :attr:`data`.
+        * :class:`InnerPacketUnpackError` - a decoder was selected (the
+          protocol was recognized) but it rejected the payload as truncated or
+          malformed; the raw payload is still in :attr:`data` and the original
+          exception is on ``unpack_error.inner_error``.
+
+        The presence of this attribute never changes :attr:`data`, the header
+        fields, or any other default access path - malformed input is recorded,
+        never silently relabeled as an unknown protocol.
+        """
+        return self._unpack_error
+
+    def _record_unpack_error(self, error, type_id=None):
+        """Attach a payload-layer decode failure to this packet.
+
+        Centralizes bookkeeping so every dispatch site reports failures the
+        same way and nothing is swallowed without context.
+        """
+        self._unpack_error = error
+        if isinstance(error, UnknownProtocolError):
+            self._unpack_unknown_type = type_id
+        return error
+
+    def _unpack_inner(self, dispatch, payload, type_id, fallback=None):
+        """Dispatch the payload to a decoder, recording distinguishable failures.
+
+        This is the single, uniform way layered protocols should decode their
+        payload. It keeps the long-standing behavior - on any failure the raw
+        payload remains available through :attr:`data` - while no longer
+        conflating two very different outcomes:
+
+        * the protocol identifier has no registered decoder (genuinely
+          unknown protocol) -> :class:`UnknownProtocolError`;
+        * a decoder was selected but raised (truncated/malformed payload of a
+          *known* protocol) -> :class:`InnerPacketUnpackError` wrapping the
+          original exception.
+
+        Args:
+            dispatch: zero-argument callable returning the decoder class for
+                ``type_id``. It raises :class:`KeyError` when the protocol is
+                not registered (e.g. ``lambda: self._typesw[type_id]``).
+            payload: raw payload bytes to hand to the decoder.
+            type_id: protocol/type/proto number from the outer header, kept on
+                the recorded error for diagnostics (may be ``None``).
+            fallback: bytes to store in :attr:`data` when decoding fails.
+                Defaults to ``payload`` (the bytes passed to the decoder).
+
+        Returns:
+            The decoded inner :class:`Packet` on success, otherwise ``None``
+            (in which case :attr:`data` holds the fallback bytes and
+            :attr:`unpack_error` describes the failure).
+        """
+        try:
+            inner_cls = dispatch()
+        except KeyError:
+            # No decoder registered: the protocol itself is unknown. The
+            # payload bytes are not claimed to be invalid.
+            self.data = fallback if fallback is not None else payload
+            self._record_unpack_error(
+                UnknownProtocolError(self.__class__, type_id), type_id)
+            return None
+
+        try:
+            inner = inner_cls(payload)
+        except UnpackError as e:
+            # The protocol was recognized but the payload is truncated or
+            # malformed - preserve the failing layer and the concrete reason
+            # instead of masking it as an unknown protocol.
+            self.data = fallback if fallback is not None else payload
+            err = InnerPacketUnpackError(
+                self.__class__, e, type_id=type_id,
+                protocol_name=inner_cls.__name__)
+            self._record_unpack_error(err, type_id)
+            return None
+        except struct.error as e:
+            # Some decoders raise struct.error directly instead of converting
+            # it to an UnpackError; treat it as a malformed known protocol too.
+            self.data = fallback if fallback is not None else payload
+            cause = UnpackError('struct unpack failed: %s' % e)
+            err = InnerPacketUnpackError(
+                self.__class__, cause, type_id=type_id,
+                protocol_name=inner_cls.__name__)
+            self._record_unpack_error(err, type_id)
+            return None
+
+        # success: clear any error inherited from a previous decode attempt
+        self._unpack_error = None
+        self._unpack_unknown_type = None
+        self.data = inner
+        setattr(self, inner.__class__.__name__.lower(), inner)
+        return inner
 
     def _create_public_fields(self):
         """Construct __public_fields__ to be used inside __repr__ and pprint"""
@@ -559,3 +747,129 @@ def test_repr():
 
     # verify repr
     assert repr(test_packet) == "TestPacket(a=1, b=2, c_flag=3, d=4)"
+
+
+def test_decode_error_hierarchy():
+    """Unknown protocol and malformed-payload failures are distinct types."""
+    import pytest
+
+    # both are decode failures and thus unpack failures, but neither is the other
+    assert issubclass(UnknownProtocolError, DecodeError)
+    assert issubclass(InnerPacketUnpackError, DecodeError)
+    assert issubclass(DecodeError, UnpackError)
+    assert not issubclass(UnknownProtocolError, InnerPacketUnpackError)
+    assert not issubclass(InnerPacketUnpackError, UnknownProtocolError)
+
+    # error objects carry the failing layer, type id and a useful message
+    uerr = UnknownProtocolError(Packet, 0x9999)
+    assert uerr.layer is Packet
+    assert uerr.type_id == 0x9999
+    assert uerr.protocol_name is None
+    assert '0x9999' in str(uerr)
+
+    cause = NeedData('got 7, 20 needed at least')
+    ierr = InnerPacketUnpackError(Packet, cause, type_id=0x0800,
+                                  protocol_name='IP')
+    assert ierr.layer is Packet
+    assert ierr.type_id == 0x0800
+    assert ierr.protocol_name == 'IP'
+    assert ierr.inner_error is cause
+    assert ierr.reason is cause
+    assert 'IP' in str(ierr) and '20 needed' in str(ierr)
+
+
+def test_unpack_inner_distinguishes_failures():
+    """The shared dispatcher separates unknown protocols from malformed ones."""
+    import pytest
+
+    class Inner(Packet):
+        __hdr__ = (('x', 'B', 0),)
+
+    class Outer(Packet):
+        __hdr__ = (('t', 'B', 0),)
+        _typesw = {1: Inner}
+
+        def unpack(self, buf):
+            Packet.unpack(self, buf)
+            self._unpack_inner(lambda: self._typesw[self.t], self.data, self.t)
+
+    # success: decoded inner packet, no error recorded
+    ok = Outer(b'\x01\x2a')
+    assert isinstance(ok.data, Inner)
+    assert ok.data.x == 0x2a
+    assert ok.unpack_error is None
+    assert ok._unpack_unknown_type is None
+
+    # unknown protocol: raw payload preserved + UnknownProtocolError
+    raw = b'\x02somebytes'
+    unknown = Outer(raw)
+    err = unknown.unpack_error
+    assert isinstance(err, UnknownProtocolError)
+    assert not isinstance(err, InnerPacketUnpackError)
+    assert err.type_id == 2
+    assert unknown._unpack_unknown_type == 2
+    assert unknown.data == raw[1:]
+    assert isinstance(unknown.data, bytes)  # not disguised as a Packet
+
+    # recognized protocol, truncated payload: InnerPacketUnpackError keeps the
+    # reason; the malformed bytes are NOT relabeled as an unknown protocol
+    malformed = b'\x01'  # Inner needs 1 payload byte after the 1-byte header
+    bad = Outer(malformed)
+    err = bad.unpack_error
+    assert isinstance(err, InnerPacketUnpackError)
+    assert not isinstance(err, UnknownProtocolError)
+    assert err.protocol_name == 'Inner'
+    assert err.type_id == 1
+    assert isinstance(err.inner_error, UnpackError)
+    assert bad.data == b''  # raw payload still reachable, nothing was raised
+
+
+def test_unpack_inner_struct_error_is_malformed_not_unknown():
+    """A decoder raising struct.error is a malformed known protocol."""
+
+    class Inner(Packet):
+        __hdr__ = (('x', 'B', 0),)
+
+    class Outer(Packet):
+        __hdr__ = (('t', 'B', 0),)
+        _typesw = {1: Inner}
+
+        def unpack(self, buf):
+            Packet.unpack(self, buf)
+            self._unpack_inner(lambda: self._typesw[self.t], self.data, self.t)
+
+    # header byte present but empty payload -> NeedData surfaced as a malformed
+    # inner packet, never as an unknown protocol
+    pkt = Outer(b'\x01')
+    assert isinstance(pkt.unpack_error, InnerPacketUnpackError)
+    assert not isinstance(pkt.unpack_error, UnknownProtocolError)
+
+
+def test_unpack_inner_fallback_buffer_is_respected():
+    """Callers control which raw bytes remain available after a failure."""
+
+    class Inner(Packet):
+        __hdr__ = (('x', 'B', 0),)
+
+    class Outer(Packet):
+        __hdr__ = (('t', 'B', 0),)
+        _typesw = {1: Inner}
+
+        def unpack(self, buf):
+            Packet.unpack(self, buf)
+            # decode a shifted payload but keep the full original data on failure
+            self._unpack_inner(
+                lambda: self._typesw[self.t], self.data, self.t,
+                fallback=buf[1:])
+
+    pkt = Outer(b'\x09\x01')  # type 9 unknown
+    assert isinstance(pkt.unpack_error, UnknownProtocolError)
+    assert pkt.data == b'\x01'
+
+
+def test_default_constructed_packet_has_no_unpack_error():
+    class Foo(Packet):
+        __hdr__ = (('foo', 'I', 0),)
+
+    assert Foo().unpack_error is None
+    assert Foo(foo=5).unpack_error is None

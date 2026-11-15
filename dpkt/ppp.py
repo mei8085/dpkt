@@ -56,11 +56,8 @@ class PPP(dpkt.Packet):
             except struct.error:
                 raise dpkt.NeedData
             self.data = self.data[1:]
-        try:
-            self.data = self._protosw[self.p](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, struct.error, dpkt.UnpackError):
-            pass
+        self._unpack_inner(
+            lambda: self._protosw[self.p], self.data, self.p)
 
     def pack_hdr(self):
         try:
@@ -186,3 +183,23 @@ def test_proto_loading():
     _mod_init()
     # we should get the same answer as if NON_EXISTENT_PROTO didn't exist
     assert PPP._protosw == standard_protos
+
+
+def test_ppp_unknown_proto_records_unknown_protocol():
+    # PPP header (addr, cntrl, p=0x21 -> compressed form is 1 byte); use a
+    # protocol number with no registered decoder and a payload
+    pkt = PPP(b'\xff\x03\x00\x00' + b'abc')  # p read as 0x0000 -> unknown
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert pkt.data == b'abc'
+
+
+def test_ppp_malformed_known_proto_records_reason():
+    # p = PPP_IP (0x21, compressed), IP payload truncated to a few bytes
+    pkt = PPP(b'\xff\x03\x21' + b'\x45\x00\x00')
+    err = pkt.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'IP'
+    assert isinstance(err.inner_error, dpkt.UnpackError)

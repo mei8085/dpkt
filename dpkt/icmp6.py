@@ -86,8 +86,23 @@ class ICMP6(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        try:
-            self.data = self._typesw[self.type](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            pass
+        self._unpack_inner(
+            lambda: self._typesw[self.type], self.data, self.type)
+
+
+def test_icmp6_unknown_vs_malformed():
+    # unregistered type 99 -> unknown protocol, raw payload kept
+    u = ICMP6(b'\x63\x00\x00\x00' + b'data')
+    err = u.unpack_error
+    assert isinstance(err, dpkt.UnknownProtocolError)
+    assert not isinstance(err, dpkt.InnerPacketUnpackError)
+    assert err.type_id == 99
+    assert u.data == b'data'
+
+    # type 1 (Unreach) recognized but its 4-byte ptr header is truncated
+    m = ICMP6(b'\x01\x00\x00\x00' + b'\x00')
+    err = m.unpack_error
+    assert isinstance(err, dpkt.InnerPacketUnpackError)
+    assert not isinstance(err, dpkt.UnknownProtocolError)
+    assert err.protocol_name == 'Unreach'
+    assert isinstance(err.inner_error, dpkt.UnpackError)
