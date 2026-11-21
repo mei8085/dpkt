@@ -50,13 +50,27 @@ class PPPoE(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        try:
-            if self.code == 0:
-                # We need to use the pppoe.PPP header here, because PPPoE
-                # doesn't do the normal encapsulation.
-                self.data = self.ppp = PPP(self.data)
-        except dpkt.UnpackError:
-            pass
+        if self.code != 0:
+            return
+        # The PPPoE payload length bounds the session payload.  Honour it so
+        # padding injected past the announced end never reaches the PPP/IP
+        # decoders (and never shifts the next packet's boundary).
+        payload = self.data
+        if self.len:
+            if self.len < 2:
+                # the PPP protocol field is at least one byte, normally two
+                raise dpkt.InvalidPacket(
+                    'PPPoE payload length %d is too small' % self.len)
+            if self.len > len(payload):
+                self._note_truncated(self.len, len(payload), what='PPPoE payload')
+            elif self.len < len(payload):
+                self._note_trailing(payload[self.len:], what='PPPoE payload')
+                payload = payload[:self.len]
+            else:
+                payload = payload[:self.len]
+        # We need to use the pppoe.PPP header here, because PPPoE doesn't do
+        # the normal encapsulation.
+        self._decode_payload(lambda: PPP, payload, 'PPP')
 
 
 class PPP(ppp.PPP):
@@ -74,11 +88,7 @@ class PPP(ppp.PPP):
             except struct.error:
                 raise dpkt.NeedData
             self.data = self.data[1:]
-        try:
-            self.data = self._protosw[self.p](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, struct.error, dpkt.UnpackError):
-            pass
+        self._decode_payload(lambda: self._protosw[self.p], self.data, self.p)
 
     def pack_hdr(self):
         try:
@@ -194,3 +204,31 @@ def test_ppp_pack_hdr():
 
 
 # XXX - TODO TLVs, etc.
+
+
+def test_pppoe_len_bounds_payload():
+    """The PPPoE payload length is authoritative; padding never reaches PPP."""
+    from . import ppp
+    # session id, code 0 (session), payload length 4 (2-byte PPP proto + 2 bytes)
+    hdr = b'\x11\x00\x00\x01\x00\x04'
+    payload = b'\x00\x21' + b'AB'  # PPP_IP proto + payload
+    buf = hdr + payload + b'\x00\x00\x00\x00\x00\x00'  # Ethernet padding
+    p = PPPoE(buf)
+    assert p.len == 4
+    assert isinstance(p.data, PPP)
+    assert p.data.p == ppp.PPP_IP
+    assert p.data.data == b'AB'
+    assert dpkt.ISSUE_PADDING in [i.code for i in p.issues]
+
+
+def test_pppoe_len_truncated_is_recorded():
+    hdr = b'\x11\x00\x00\x01\x00\x40'  # claims 64 bytes
+    p = PPPoE(hdr + b'\x00\x21AB')
+    assert dpkt.ISSUE_TRUNCATED in [i.code for i in p.issues]
+
+
+def test_pppoe_discard_code_not_decoded():
+    # discovery packets (code != 0) carry no PPP frame
+    p = PPPoE(b'\x11\x09\x00\x00\x00\x00')
+    assert p.code != 0
+    assert p.data == b''

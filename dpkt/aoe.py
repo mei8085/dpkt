@@ -2,8 +2,6 @@
 """ATA over Ethernet Protocol."""
 from __future__ import absolute_import
 
-import struct
-
 from . import dpkt
 from .compat import iteritems
 
@@ -45,11 +43,7 @@ class AOE(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        try:
-            self.data = self._cmdsw[self.cmd](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, struct.error, dpkt.UnpackError):
-            pass
+        self._decode_payload(lambda: self._cmdsw[self.cmd], self.data, self.cmd)
 
 
 AOE_CMD_ATA = 0

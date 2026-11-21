@@ -56,11 +56,7 @@ class PPP(dpkt.Packet):
             except struct.error:
                 raise dpkt.NeedData
             self.data = self.data[1:]
-        try:
-            self.data = self._protosw[self.p](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, struct.error, dpkt.UnpackError):
-            pass
+        self._decode_payload(lambda: self._protosw[self.p], self.data, self.p)
 
     def pack_hdr(self):
         try:

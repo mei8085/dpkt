@@ -103,12 +103,8 @@ class GRE(dpkt.Packet):
                 if not sre.len:
                     break
             self.sre = l_
-        try:
-            self.data = ethernet.Ethernet._typesw[self.p](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            # data already set
-            pass
+        self._decode_payload(
+            lambda: ethernet.Ethernet._typesw[self.p], self.data, self.p)
 
     def __len__(self):
         opt_fmtlen = struct.calcsize(''.join(self.opt_fields_fmts()[1]))

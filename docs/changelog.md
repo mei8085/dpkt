@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+- Added received-packet consistency checking (`dpkt.validation`, `dpkt.Report`,
+  `dpkt.Issue`): outer/inner length fields and checksums must agree with the
+  captured bytes before a packet is trusted, and every parser records what it
+  observed in `packet.issues`.
+- Enforced length boundaries while parsing: IPv4 total length, IPv6 payload and
+  extension-header lengths, UDP length, TCP data offset, PPPoE/PPP lengths and
+  802.3 lengths now bound the payload; trailing bytes never become payload and
+  a truncated buffer is reported instead of disguised.
+- Added `dpkt.defrag.Defragmenter` / `FragmentationError` with consistent,
+  resource-bounded IPv4 reassembly that rejects overlapping or illegal
+  datagrams (including bad lengths/checksums that only exist after assembly).
+- New `dpkt.TruncatedPacket` / `dpkt.InvalidPacket` (both `dpkt.UnpackError`
+  subclasses) distinguish "needs more data" from "self-contradictory header".
+
 ## 1.9.8
 **[2022-08-17]**
 - Fixed endianness issues in PCAPNG, Loopback

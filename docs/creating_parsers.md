@@ -262,3 +262,55 @@ IP(
   )  # UDP
 )  # IP
 ```
+
+## Received-packet consistency
+
+dpkt is deliberately lenient when *building* packets, but a packet that was
+*received* is only trustworthy when the length announced by each layer agrees
+with the bytes that were actually captured. Two pieces work together:
+
+1.  Every parser records what it observed while unpacking in `packet.issues`
+    (a list of `dpkt.Issue` objects). Truncation, bytes past the announced
+    length, contradictory nested lengths and undecodable payloads all show up
+    there, tied to the layer that saw them. The raw payload is never replaced
+    by a partially decoded header.
+2.  `dpkt.validation.check_packet()` walks the whole layer stack, adds checksum
+    verification (IPv4, UDP, TCP, ICMP, ICMPv6, over their exact advertised
+    coverage) and returns a `dpkt.Report`.
+
+```python
+from dpkt import validation
+
+report = validation.check_packet(eth)
+if not report:
+    print(report.status, report.reason)     # e.g. "truncated", "... 40 bytes ..."
+
+# or reject inconsistent input outright:
+eth = validation.receive(buf)                # raises ConsistencyError
+```
+
+The rules enforced by the parsers:
+
+*   The outer length is authoritative. An IPv4 total length, IPv6 payload
+    length, PPPoE payload length, UDP length or 802.3 length bounds the payload
+    handed to the next decoder. Bytes beyond it are reported as trailing (all
+    zero bytes are treated as link-layer padding, which is informational only)
+    and never become part of the next layer, so they cannot shift the boundary
+    of the following packet.
+*   A buffer shorter than the announced length is reported as truncated; it is
+    never silently decoded as though it were complete.
+*   Header offsets that leave no room for the fixed header (IPv4 IHL, TCP data
+    offset, IPv6 extension-header length) raise `InvalidPacket` /
+    `TruncatedPacket`, and the offending layer is *not* inserted into the next
+    parser (the raw bytes stay in `data`).
+*   Transport layers inside the first fragment of a fragmented IPv4 datagram
+    announce a length and checksum that only exist after reassembly; those
+    errors are deferred (reported as the informational `fragment` issue) until
+    `dpkt.defrag.Defragmenter` has reassembled the datagram, which then
+    verifies it.
+
+`dpkt.defrag.Defragmenter` applies the same checks to reassembled datagrams:
+overlapping or conflicting fragments reject the set (`FragmentationError`),
+and a completed datagram whose payload lengths or checksums do not survive
+reassembly is rejected instead of being returned. The reassembler remains
+usable after a rejection.

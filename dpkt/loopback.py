@@ -29,22 +29,22 @@ class Loopback(dpkt.Packet):
         dpkt.Packet.unpack(self, buf)
         if self.family in (0x02, 0x02000000):
             self.family = 2
-            self.data = ip.IP(self.data)
+            self._decode_payload(lambda: ip.IP, self.data, 'IPv4')
 
         elif self.family in (0x18, 0x18000000):
             self.family = 24
-            self.data = ip6.IP6(self.data)
+            self._decode_payload(lambda: ip6.IP6, self.data, 'IPv6')
 
         elif self.family in (0x1c, 0x1c000000):
             self.family = 28
-            self.data = ip6.IP6(self.data)
+            self._decode_payload(lambda: ip6.IP6, self.data, 'IPv6')
 
         elif self.family in (0x1e, 0x1e000000):
             self.family = 30
-            self.data = ip6.IP6(self.data)
+            self._decode_payload(lambda: ip6.IP6, self.data, 'IPv6')
 
         else:
-            self.data = ethernet.Ethernet(self.data)
+            self._decode_payload(lambda: ethernet.Ethernet, self.data, 'Ethernet')
 
 
 def test_ethernet_unpack():

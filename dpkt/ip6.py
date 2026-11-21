@@ -74,17 +74,45 @@ class IP6(dpkt.Packet):
         self.all_extension_headers = []
 
         if self.plen:
-            buf = self.data[:self.plen]
+            payload = self.data
+            if self.plen > len(payload):
+                self._note_truncated(self.plen, len(payload), what='IPv6 payload')
+            elif self.plen < len(payload):
+                self._note_trailing(payload[self.plen:], what='IPv6 payload')
+                payload = payload[:self.plen]
+            else:
+                payload = payload[:self.plen]
+            buf = payload
         else:  # due to jumbo payload or TSO
             buf = self.data
 
         next_ext_hdr = self.nxt
+        ext = None
 
         while next_ext_hdr in EXT_HDRS:
-            ext = EXT_HDRS_CLS[next_ext_hdr](buf)
+            ext_cls = EXT_HDRS_CLS[next_ext_hdr]
+            if len(buf) < ext_cls.__hdr_len__:
+                raise dpkt.TruncatedPacket(
+                    '%s needs %d bytes, got %d' %
+                    (ext_cls.__name__, ext_cls.__hdr_len__, len(buf)))
+            try:
+                ext = ext_cls(buf)
+            except dpkt.UnpackError as e:
+                # the extension header claims more bytes than were captured;
+                # stop here rather than mis-parsing later headers against a
+                # boundary that does not exist
+                raise dpkt.TruncatedPacket(
+                    '%s could not be unpacked: %s' % (ext_cls.__name__, e))
             self.extension_hdrs[next_ext_hdr] = ext
             self.all_extension_headers.append(ext)
-            buf = buf[ext.length:]
+            if ext.length > len(buf):
+                self._note_length(
+                    '%s announces %d bytes but only %d were captured' %
+                    (ext_cls.__name__, ext.length, len(buf)),
+                    announced=ext.length, captured=len(buf), what=ext_cls.__name__)
+                buf = b''
+            else:
+                buf = buf[ext.length:]
             next_ext_hdr = getattr(ext, 'nxt', None)
 
         # set the payload protocol id
@@ -93,15 +121,17 @@ class IP6(dpkt.Packet):
 
         # do not decode fragments after the first fragment
         # https://github.com/kbandla/dpkt/issues/575
-        if self.nxt == 44 and ext.frag_off > 0:  # 44 = IP_PROTO_FRAGMENT
+        if self.nxt == 44 and ext is not None and ext.frag_off > 0:
             self.data = buf
             return
 
-        try:
-            self.data = self._protosw[next_ext_hdr](buf)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
+        if next_ext_hdr is None:
             self.data = buf
+            self._note_undecoded(None, 'no next-header protocol after extension headers')
+            return
+
+        self._decode_payload(lambda: self._protosw[next_ext_hdr], buf,
+                             next_ext_hdr)
 
     def headers_str(self):
         nxt = self.nxt

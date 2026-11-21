@@ -112,19 +112,55 @@ class IP(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        ol = ((self._v_hl & 0xf) << 2) - self.__hdr_len__
+        hdr_len = (self._v_hl & 0xf) << 2
+        ol = hdr_len - self.__hdr_len__
         if ol < 0:
-            raise dpkt.UnpackError('invalid header length')
-        self.opts = buf[self.__hdr_len__:self.__hdr_len__ + ol]
+            raise dpkt.InvalidPacket('invalid header length %d (smaller than %d)' %
+                                     (hdr_len, self.__hdr_len__))
+        if hdr_len > len(buf):
+            raise dpkt.TruncatedPacket('IPv4 header length %d exceeds captured %d' %
+                                       (hdr_len, len(buf)))
+        self.opts = buf[self.__hdr_len__:hdr_len]
+
+        # The total length field is authoritative: it bounds both this packet's
+        # payload and the boundary of whatever follows.  Bytes beyond it are
+        # never handed to the transport decoder.
         if self.len:
-            buf = buf[self.__hdr_len__ + ol:self.len]
+            if self.len < hdr_len:
+                raise dpkt.InvalidPacket(
+                    'IPv4 total length %d is smaller than its header length %d' %
+                    (self.len, hdr_len))
+            payload_end = self.len
+            if self.len > len(buf):
+                self._note_truncated(self.len, len(buf), what='IPv4 datagram')
+                payload_end = len(buf)
+            elif self.len < len(buf):
+                self._note_trailing(buf[self.len:], what='IPv4 datagram')
+            buf = buf[hdr_len:payload_end]
         else:  # very likely due to TCP segmentation offload
-            buf = buf[self.__hdr_len__ + ol:]
-        try:
-            self.data = self._protosw[self.p](buf) if self.offset == 0 else buf
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
+            buf = buf[hdr_len:]
+
+        # only the first fragment carries a transport header
+        if self.offset != 0:
             self.data = buf
+            return
+        try:
+            cls = self._protosw[self.p]
+        except KeyError:
+            self.data = buf
+            self._note_undecoded(self.p, 'no decoder registered for IP protocol %r' % (self.p,))
+            return
+        inner = self._decode_payload(lambda: cls, buf, self.p)
+        if inner is None:
+            # _decode_payload left the raw payload in self.data
+            return
+        if self.mf:
+            # This is the first fragment of a fragmented datagram: the transport
+            # header is present, but its length fields and checksum cover data
+            # that lives in later fragments.  Do not report that as an error.
+            inner._demote_issues(
+                dpkt.ISSUE_FRAGMENT,
+                'fragment carries only part of the datagram')
 
     @classmethod
     def set_proto(cls, p, pktclass):
@@ -502,3 +538,79 @@ def test_default_udp_checksum():
 def test_get_proto_name():
     assert get_ip_proto_name(6) == 'TCP'
     assert get_ip_proto_name(999) is None
+
+
+def test_ip_total_length_bounds_payload():
+    """IPv4 total length bounds the payload and everything after it."""
+    from . import udp
+    # IP total length 28 -> 8-byte UDP header only; 4 trailing bytes follow
+    s = (b'\x45\x00\x00\x1c\x00\x00\x00\x00\x40\x11\x00\x00'
+         b'\x0a\x00\x00\x01\x0a\x00\x00\x02'
+         b'\x00\x01\x00\x02\x00\x08\x00\x00' + b'GARBAGE!')
+    ip = IP(s)
+    assert isinstance(ip.data, udp.UDP)
+    assert ip.data.data == b''
+    assert dpkt.ISSUE_TRAILING in [i.code for i in ip.issues]
+
+
+def test_ip_total_length_truncated_is_recorded():
+    # declares a 40-byte datagram but only 28 were captured
+    s = (b'\x45\x00\x00\x28\x00\x00\x00\x00\x40\x11\x00\x00'
+         b'\x0a\x00\x00\x01\x0a\x00\x00\x02'
+         b'\x00\x01\x00\x02\x00\x08\x00\x00')
+    ip = IP(s)
+    assert dpkt.ISSUE_TRUNCATED in [i.code for i in ip.issues]
+
+
+def test_ip_total_length_smaller_than_header_rejected():
+    import pytest
+    s = b'\x45\x00\x00\x10\x00\x00\x00\x00\x40\x11\x00\x00' + b'\x00' * 8
+    with pytest.raises(dpkt.InvalidPacket):
+        IP(s)
+
+
+def test_ip_header_length_beyond_capture_rejected():
+    import pytest
+    # IHL says 60 bytes, only 20 captured
+    s = b'\x4f\x00\x00\x14\x00\x00\x00\x00\x40\x11\x00\x00' + b'\x00' * 8
+    with pytest.raises(dpkt.TruncatedPacket):
+        IP(s)
+
+
+def test_ip_inconsistent_transport_not_exposed():
+    """A transport layer whose own header is truncated is not inserted."""
+    # proto 6 (TCP), payload shorter than the fixed TCP header
+    s = (b'\x45\x00\x00\x1c\x00\x00\x00\x00\x40\x06\x00\x00'
+         b'\x0a\x00\x00\x01\x0a\x00\x00\x02' + b'\x00\x50\x00\x50')
+    ip = IP(s)
+    assert ip.data == b'\x00\x50\x00\x50'  # raw bytes, not a TCP object
+    assert dpkt.ISSUE_TRUNCATED in [i.code for i in ip.issues]
+
+
+def test_ip_first_fragment_length_deferred():
+    """The first fragment of a fragmented datagram is not judged on its own.
+
+    Its UDP length covers bytes in later fragments, so that "mismatch" must
+    not be reported as an error - only reassembly can decide.
+    """
+    from . import udp
+    # the UDP header announces 20 bytes; this first fragment carries 12
+    payload = b'\x00\x01\x00\x02\x00\x14\x00\x00' + b'ABCD'
+    s = (b'\x45\x00\x00\x20\x00\x00\x20\x00\x40\x11\x00\x00'
+         b'\x0a\x00\x00\x01\x0a\x00\x00\x02' + payload)
+    ip = IP(s)
+    assert ip.mf == 1 and ip.offset == 0
+    assert isinstance(ip.data, udp.UDP)
+    assert ip.data.data == b'ABCD'
+    assert [i for i in ip.issues if i.is_error] == []
+    assert dpkt.ISSUE_FRAGMENT in [i.code for i in ip.data.issues]
+
+
+def test_ip_non_first_fragment_not_decoded():
+    """Later fragments carry no transport header; payload stays raw."""
+    s = (b'\x45\x00\x00\x1c\x00\x00\x20\x01\x40\x11\x00\x00'
+         b'\x0a\x00\x00\x01\x0a\x00\x00\x02' + b'POSTFRAG')  # offset == 1
+    ip = IP(s)
+    assert ip.offset == 1 and ip.mf == 1
+    assert ip.data == b'POSTFRAG'
+    assert ip.issues == []

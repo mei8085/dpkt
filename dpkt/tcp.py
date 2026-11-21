@@ -95,11 +95,18 @@ class TCP(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        ol = ((self._off_flags >> 12) << 2) - self.__hdr_len__
+        hdr_len = (self._off_flags >> 12) << 2
+        ol = hdr_len - self.__hdr_len__
         if ol < 0:
-            raise dpkt.UnpackError('invalid header length')
-        self.opts = buf[self.__hdr_len__:self.__hdr_len__ + ol]
-        self.data = buf[self.__hdr_len__ + ol:]
+            raise dpkt.InvalidPacket('invalid header length %d (smaller than %d)' %
+                                     (hdr_len, self.__hdr_len__))
+        if hdr_len > len(buf):
+            # the header claims options that were not captured; do not interpret
+            # the absent bytes as payload
+            raise dpkt.TruncatedPacket('TCP header length %d exceeds captured %d' %
+                                       (hdr_len, len(buf)))
+        self.opts = buf[self.__hdr_len__:hdr_len]
+        self.data = buf[hdr_len:]
 
 
 # Options (opt_type) - http://www.iana.org/assignments/tcp-parameters

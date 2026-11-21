@@ -30,6 +30,233 @@ class PackError(Error):
     pass
 
 
+class TruncatedPacket(NeedData):
+    """The buffer ends before the length the protocol announced.
+
+    This is the "captured fewer bytes than the header claims" case:  the outer
+    header parsed, but the layer declares a length (or an offset to the next
+    header) that runs past the end of the buffer that was handed to it.  It is
+    a :class:`NeedData` subclass, so existing ``except UnpackError`` handlers
+    keep working.
+    """
+
+
+class InvalidPacket(UnpackError):
+    """The bytes contradict the lengths/offsets the protocol announces.
+
+    Unlike :class:`TruncatedPacket` this is not a "need more data" condition:
+    the packet is self-inconsistent (for example an IPv4 total length smaller
+    than its own header, a header offset that leaves no room for the fixed
+    header, or a checksum that does not cover what it claims to cover).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Received-packet consistency reporting
+#
+# Every parser records what it observed while unpacking (announced lengths vs.
+# captured bytes, contradictory offsets, inner decodes that were rejected) in
+# ``Packet.issues``.  ``dpkt.validation`` turns that into a verdict and is able
+# to re-verify the checksums of the whole layer stack.  Keeping the reporting
+# objects here avoids a dependency cycle (validation imports dpkt, not the
+# other way round) and exports them from the ``dpkt`` package namespace.
+# ---------------------------------------------------------------------------
+
+# issue codes (stable, machine readable)
+ISSUE_TRUNCATED = 'truncated'                 # announced length > captured bytes
+ISSUE_TRAILING = 'trailing'                   # extra bytes beyond announced length
+ISSUE_LENGTH = 'length'                       # nested length fields disagree
+ISSUE_CHECKSUM = 'checksum'                   # checksum does not verify
+ISSUE_INVALID_HEADER = 'invalid-header'       # header offset/length impossible
+ISSUE_UNDECODED = 'undecoded'                 # payload was not inserted into a decoder
+ISSUE_PADDING = 'padding'                     # tolerated link-layer padding (informational)
+ISSUE_FRAGMENT = 'fragment'                   # length only meaningful after reassembly
+
+_ERROR_CODES = frozenset([ISSUE_TRUNCATED, ISSUE_TRAILING, ISSUE_LENGTH,
+                          ISSUE_CHECKSUM, ISSUE_INVALID_HEADER])
+
+
+class Issue(object):
+    """One consistency problem, tied to the layer that observed it.
+
+    Attributes:
+        code: stable identifier, one of the ``ISSUE_*`` constants.
+        layer: class of the packet layer that observed the problem.
+        message: human readable description.
+        details: dict of extra values (lengths, offsets, protocol names, ...).
+    """
+
+    __slots__ = ('code', 'layer', 'message', 'details')
+
+    def __init__(self, code, layer, message, **details):
+        self.code = code
+        self.layer = layer
+        self.message = message
+        self.details = details
+
+    @property
+    def severity(self):
+        return 'error' if self.code in _ERROR_CODES else 'info'
+
+    @property
+    def is_error(self):
+        return self.code in _ERROR_CODES
+
+    @property
+    def layer_name(self):
+        return getattr(self.layer, '__name__', str(self.layer))
+
+    def __repr__(self):
+        return 'Issue(%r, %r, %r)' % (self.code, self.layer_name, self.message)
+
+    def __str__(self):
+        return '%s: %s: %s' % (self.layer_name, self.code, self.message)
+
+
+class Report(object):
+    """Result of a consistency check: an ordered collection of :class:`Issue`.
+
+    ``bool(report)`` is ``True`` for a trustworthy packet.  ``status`` is
+    ``'ok'`` or the code of the first error-level issue.
+    """
+
+    __slots__ = ('issues',)
+
+    def __init__(self, issues=None):
+        self.issues = list(issues or [])
+
+    def add(self, issue):
+        self.issues.append(issue)
+        return issue
+
+    def extend(self, issues):
+        self.issues.extend(issues)
+        return self
+
+    @property
+    def errors(self):
+        return [i for i in self.issues if i.is_error]
+
+    @property
+    def informational(self):
+        return [i for i in self.issues if not i.is_error]
+
+    @property
+    def valid(self):
+        return not self.errors
+
+    # alias used by callers that think in terms of consistency
+    consistent = valid
+
+    @property
+    def ok(self):
+        return self.valid
+
+    @property
+    def status(self):
+        for issue in self.issues:
+            if issue.is_error:
+                return issue.code
+        return 'ok'
+
+    @property
+    def reasons(self):
+        return [i.message for i in self.errors]
+
+    @property
+    def reason(self):
+        for issue in self.issues:
+            if issue.is_error:
+                return issue.message
+        return None
+
+    @property
+    def codes(self):
+        return [i.code for i in self.issues]
+
+    def to_dict(self):
+        return {
+            'status': self.status,
+            'valid': self.valid,
+            'issues': [{'code': i.code, 'layer': i.layer_name,
+                        'message': i.message, 'details': dict(i.details)}
+                       for i in self.issues],
+        }
+
+    def raise_if_invalid(self, packet=None):
+        """Raise the matching :class:`ConsistencyError` subclass if invalid."""
+        if not self.valid:
+            raise _error_from_report(self, packet)
+        return self
+
+    def __bool__(self):
+        return self.valid
+
+    # Python 2 compatible truthiness
+    __nonzero__ = __bool__
+
+    def __repr__(self):
+        return 'Report(status=%r, issues=%r)' % (self.status, self.issues)
+
+
+class ConsistencyError(UnpackError):
+    """A received packet failed the consistency check.
+
+    The full :class:`Report` is available as :attr:`report`.
+    """
+
+    def __init__(self, message=None, report=None, layer=None):
+        self.report = report if report is not None else Report()
+        self.layer = layer
+        if message is None:
+            message = self.report.reason or 'packet is inconsistent'
+        super(ConsistencyError, self).__init__(message)
+
+    @property
+    def issues(self):
+        return self.report.issues
+
+
+class TruncationError(ConsistencyError):
+    """The captured buffer is shorter than the announced length."""
+
+
+class TrailingDataError(ConsistencyError):
+    """Bytes follow the announced end of a packet."""
+
+
+class LengthMismatchError(ConsistencyError):
+    """Nested length fields contradict each other."""
+
+
+class ChecksumError(ConsistencyError):
+    """A checksum does not verify over its advertised coverage."""
+
+
+class ReassemblyError(ConsistencyError):
+    """A reassembled datagram is illegal (or the fragment set is ambiguous)."""
+
+
+_CODE_ERRORS = {
+    ISSUE_TRUNCATED: TruncationError,
+    ISSUE_TRAILING: TrailingDataError,
+    ISSUE_LENGTH: LengthMismatchError,
+    ISSUE_CHECKSUM: ChecksumError,
+    ISSUE_INVALID_HEADER: LengthMismatchError,
+}
+
+
+def _error_from_report(report, packet=None):
+    """Map the first error-level issue of a report to a ConsistencyError."""
+    layer = getattr(packet, '__class__', None)
+    for issue in report.issues:
+        if issue.is_error:
+            cls = _CODE_ERRORS.get(issue.code, ConsistencyError)
+            return cls('%s: %s' % (issue.layer_name, issue.message),
+                       report=report, layer=issue.layer)
+    return ConsistencyError(report=report, layer=layer)
+
+
 # See the "creating parsers" documentation for how all of this works
 
 
@@ -157,14 +384,24 @@ class Packet(_MetaPacket("Temp", (object,), {})):
         (matching fields in self.__hdr__, or 'data').
         """
         self.data = b''
+        # consistency problems observed while unpacking (see dpkt.validation);
+        # kept private so it does not alter __repr__/__dict__ of parsed packets
+        self._issues = []
+        # the exact bytes this layer was parsed from; used by dpkt.validation
+        # to verify checksums over their true coverage.  None for packets that
+        # were built programmatically rather than parsed from a buffer.
+        self._raw_buf = None
         if args:
+            buf = args[0]
+            if isinstance(buf, (bytes, bytearray, memoryview)):
+                self._raw_buf = bytes(buf)
             try:
-                self.unpack(args[0])
+                self.unpack(buf)
             except struct.error:
-                if len(args[0]) < self.__hdr_len__:
-                    raise NeedData('got %d, %d needed at least' % (len(args[0]), self.__hdr_len__))
+                if len(buf) < self.__hdr_len__:
+                    raise TruncatedPacket('got %d, %d needed at least' % (len(buf), self.__hdr_len__))
                 raise UnpackError('invalid %s: %r' %
-                                  (self.__class__.__name__, args[0]))
+                                  (self.__class__.__name__, buf))
         else:
             if hasattr(self, '__hdr_fields__'):
                 for k in self.__hdr_fields__:
@@ -175,6 +412,134 @@ class Packet(_MetaPacket("Temp", (object,), {})):
 
         if hasattr(self, '__hdr_fmt__'):
             self._pack_hdr = partial(struct.pack, self.__hdr_fmt__)
+
+    # -- received-packet consistency bookkeeping ---------------------------
+    @property
+    def issues(self):
+        """Consistency problems observed while unpacking this layer."""
+        return self._issues
+
+    def add_issue(self, code, message, **details):
+        """Record a consistency problem observed while unpacking this layer."""
+        issue = Issue(code, self.__class__, message, **details)
+        self._issues.append(issue)
+        return issue
+
+    def _note_truncated(self, announced, captured, what='payload'):
+        return self.add_issue(
+            ISSUE_TRUNCATED,
+            '%s announces %d bytes but only %d were captured' %
+            (what, announced, captured),
+            announced=announced, captured=captured, what=what)
+
+    def _note_trailing(self, tail, what='payload'):
+        """Record bytes found past the announced end of this layer.
+
+        ``tail`` is the leftover buffer (or an integer count when the caller has
+        already sliced it away).  All-zero tails are tolerated at the link
+        layer as padding and only reported as informational; any other trailing
+        bytes are a consistency error, because they belong to neither this
+        datagram nor the next one.
+        """
+        if isinstance(tail, (bytes, bytearray, memoryview)):
+            count = len(tail)
+            nonpadding = any(tail)
+        else:
+            count = int(tail)
+            nonpadding = count > 0
+        if count and not nonpadding:
+            return self.add_issue(
+                ISSUE_PADDING,
+                '%d zero padding bytes follow the %s' % (count, what),
+                trailing=count, what=what)
+        return self.add_issue(
+            ISSUE_TRAILING,
+            '%d unexpected bytes follow the %s' % (count, what),
+            trailing=count, what=what)
+
+    def _note_length(self, message, **details):
+        return self.add_issue(ISSUE_LENGTH, message, **details)
+
+    def _demote_issues(self, code, message, **details):
+        """Downgrade length/checksum errors on a fragment to informational.
+
+        Transport headers in the first fragment of a fragmented datagram
+        announce a length and checksum that cover the *whole* datagram; the
+        bytes that would confirm them arrive in later fragments.  Those errors
+        are therefore not errors yet - they can only be judged after
+        reassembly (which is what :class:`dpkt.defrag.Defragmenter` does).
+        """
+        demoted = []
+        for issue in self._issues:
+            if issue.is_error and issue.code != ISSUE_FRAGMENT:
+                info = dict(issue.details, original_code=issue.code)
+                info.update(details)
+                demoted.append(Issue(code, issue.layer, message, **info))
+            else:
+                demoted.append(issue)
+        self._issues = demoted
+
+    def _note_undecoded(self, payload_proto, reason, error=None):
+        """Record that the payload could not be handed to its decoder.
+
+        The raw bytes stay in :attr:`data`; they are never relabeled as a
+        successfully parsed upper layer.
+        """
+        details = {'protocol': payload_proto, 'reason': str(reason)}
+        code = ISSUE_UNDECODED
+        if isinstance(error, TruncatedPacket):
+            code = ISSUE_TRUNCATED
+        elif isinstance(error, InvalidPacket):
+            code = ISSUE_INVALID_HEADER
+        return self.add_issue(code, reason, **details)
+
+    def _decode_payload(self, dispatch, payload, proto, fallback=None):
+        """Decode ``payload`` through ``dispatch``, recording failures.
+
+        Mirrors the historical ``try: self.data = table[key](buf) except
+        (KeyError, UnpackError): self.data = buf`` behaviour, but records why
+        the payload was not inserted into the next parser.  Returns the decoded
+        inner packet, or ``None`` with :attr:`data` left as the raw fallback.
+
+        A decoder that rejects the bytes (truncated or impossible header) is
+        never inserted, so a malformed payload cannot be presented to an
+        upper-layer parser as though its header were trustworthy.
+        """
+        try:
+            inner_cls = dispatch()
+        except KeyError:
+            self.data = payload if fallback is None else fallback
+            self._note_undecoded(proto, 'no decoder registered for protocol %r' % (proto,))
+            return None
+        try:
+            inner = inner_cls(payload)
+        except KeyError:
+            self.data = payload if fallback is None else fallback
+            self._note_undecoded(proto, 'no decoder registered for protocol %r' % (proto,))
+            return None
+        except (UnpackError, struct.error) as e:
+            self.data = payload if fallback is None else fallback
+            reason = '%s could not be decoded: %s' % (
+                getattr(inner_cls, '__name__', proto), e)
+            self._note_undecoded(getattr(inner_cls, '__name__', proto),
+                                 reason, error=e)
+            return None
+        # A layer that parsed but whose *own header* contradicts the outer
+        # length fields is not trustworthy as the next layer.  Keep the raw
+        # bytes so an upper-layer parser never consumes a bad header.
+        bad_header = [i for i in getattr(inner, '_issues', ())
+                      if i.is_error and i.code in (ISSUE_LENGTH, ISSUE_INVALID_HEADER)]
+        if bad_header:
+            self.data = payload if fallback is None else fallback
+            self.add_issue(
+                bad_header[0].code,
+                '%s header is inconsistent (%s); payload kept raw' %
+                (getattr(inner_cls, '__name__', proto), bad_header[0].message),
+                protocol=getattr(inner_cls, '__name__', proto))
+            return None
+        self.data = inner
+        setattr(self, inner.__class__.__name__.lower(), inner)
+        return inner
 
     def __len__(self):
         return self.__hdr_len__ + len(self.data)
@@ -559,3 +924,74 @@ def test_repr():
 
     # verify repr
     assert repr(test_packet) == "TestPacket(a=1, b=2, c_flag=3, d=4)"
+
+
+def test_issue_codes_and_severity():
+    assert Issue(ISSUE_TRUNCATED, Packet, 'x').is_error
+    assert Issue(ISSUE_CHECKSUM, Packet, 'x').is_error
+    assert not Issue(ISSUE_PADDING, Packet, 'x').is_error
+    assert not Issue(ISSUE_UNDECODED, Packet, 'x').is_error
+    assert not Issue(ISSUE_FRAGMENT, Packet, 'x').is_error
+    assert Issue(ISSUE_TRAILING, Packet, 'x').severity == 'error'
+    assert Issue(ISSUE_FRAGMENT, Packet, 'x').severity == 'info'
+
+
+def test_report_status_and_error_types():
+    r = Report()
+    assert r.valid and r.status == 'ok' and bool(r)
+
+    r.add(Issue(ISSUE_PADDING, Packet, 'pad'))
+    assert r.valid and r.status == 'ok' and r.informational and not r.errors
+
+    r.add(Issue(ISSUE_TRAILING, Packet, 'extra'))
+    assert not r.valid and r.status == ISSUE_TRAILING
+    assert isinstance(_error_from_report(r), TrailingDataError)
+
+    r2 = Report([Issue(ISSUE_CHECKSUM, Packet, 'bad')])
+    assert isinstance(_error_from_report(r2), ChecksumError)
+    r3 = Report([Issue(ISSUE_INVALID_HEADER, Packet, 'bad')])
+    assert isinstance(_error_from_report(r3), LengthMismatchError)
+    r4 = Report([Issue(ISSUE_TRUNCATED, Packet, 'short')])
+    assert isinstance(_error_from_report(r4), TruncationError)
+
+
+def test_packet_records_issues_privately():
+    class Frag(Packet):
+        __hdr__ = (('x', 'B', 0),)
+
+    p = Frag()
+    assert p.issues == []
+    p.add_issue(ISSUE_TRUNCATED, 'short', announced=4, captured=1)
+    assert len(p.issues) == 1 and p.issues[0].details['announced'] == 4
+    # issue bookkeeping must not leak into __repr__ or the public packet dict
+    assert 'issues' not in repr(p)
+    assert '_issues' not in repr(p)
+
+
+def test_decode_payload_never_exposes_rejected_layer():
+    """A payload whose decoder raises is left raw with a recorded reason."""
+    class Inner(Packet):
+        __hdr__ = (('x', 'I', 0),)
+
+    class Outer(Packet):
+        __hdr__ = (('t', 'B', 0),)
+        _typesw = {1: Inner}
+
+        def unpack(self, buf):
+            Packet.unpack(self, buf)
+            self._decode_payload(lambda: self._typesw[self.t], self.data, self.t)
+
+    good = Outer(b'\x01\x00\x00\x00\x2a')
+    assert isinstance(good.data, Inner) and good.data.x == 0x2a
+    assert good.issues == []
+
+    bad = Outer(b'\x01\x00\x00')  # Inner needs 4 bytes
+    assert bad.data == b'\x00\x00'  # raw payload, not a half-decoded header
+    codes = [i.code for i in bad.issues]
+    assert ISSUE_TRUNCATED in codes
+    assert bad.issues[0].is_error
+
+    unknown = Outer(b'\x09xx')
+    assert unknown.data == b'xx'
+    assert unknown.issues[0].code == ISSUE_UNDECODED
+    assert not unknown.issues[0].is_error

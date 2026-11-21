@@ -86,8 +86,5 @@ class ICMP6(dpkt.Packet):
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        try:
-            self.data = self._typesw[self.type](self.data)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            pass
+        self._decode_payload(lambda: self._typesw[self.type], self.data,
+                             self.type)

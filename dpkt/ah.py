@@ -34,11 +34,7 @@ class AH(dpkt.Packet):
         self.auth = self.data[:auth_len]
         buf = self.data[auth_len:]
 
-        try:
-            self.data = ip.IP.get_proto(self.nxt)(buf)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            self.data = buf
+        self._decode_payload(lambda: ip.IP.get_proto(self.nxt), buf, self.nxt)
 
     def __len__(self):
         return self.__hdr_len__ + len(self.auth) + len(self.data)

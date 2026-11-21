@@ -82,8 +82,10 @@ class Ethernet(dpkt.Packet):
     def __init__(self, *args, **kwargs):
         self._next_type = None
         dpkt.Packet.__init__(self, *args, **kwargs)
-        # if data was given in kwargs, try to unpack it
-        if self.data:
+        # if data was given as a raw buffer in kwargs, try to unpack it; when
+        # the packet was parsed from a buffer unpack() already dispatched the
+        # payload, and decoding it a second time would duplicate bookkeeping
+        if not args and self.data:
             if isstr(self.data) or isinstance(self.data, bytes):
                 self._unpack_data(self.data)
 
@@ -116,11 +118,17 @@ class Ethernet(dpkt.Packet):
                 if lbl.s:  # bottom of stack
                     break
 
+            if not buf:
+                # no payload after the label stack; nothing to guess
+                self._next_type = None
+                self.data = buf
+                return
+
             # poor man's heuristics to guessing the next type
             if compat_ord(buf[0]) == 0x45:  # IP version 4 + header len 20 bytes
                 self._next_type = ETH_TYPE_IP
 
-            elif compat_ord(buf[0]) & 0xf0 == 0x60:  # IP version 6 
+            elif compat_ord(buf[0]) & 0xf0 == 0x60:  # IP version 6
                 self._next_type = ETH_TYPE_IP6
 
             # pseudowire Ethernet
@@ -129,12 +137,11 @@ class Ethernet(dpkt.Packet):
                     buf = buf[4:]  # skip the ECW
                 self._next_type = ETH_TYPE_TEB  # re-use TEB class mapping to decode Ethernet
 
-        try:
-            eth_type = self._next_type or self.type
-            self.data = self._typesw[eth_type](buf)
-            setattr(self, self.data.__class__.__name__.lower(), self.data)
-        except (KeyError, dpkt.UnpackError):
-            self.data = buf
+        eth_type = self._next_type or self.type
+        # Never hand the payload to a decoder under a different ethertype than
+        # the one that was announced; an incompatible inner length would then
+        # be parsed against a bogus boundary.
+        self._decode_payload(lambda: self._typesw[eth_type], buf, eth_type)
 
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
@@ -155,7 +162,8 @@ class Ethernet(dpkt.Packet):
         elif self.data.startswith(b'\xff\xff'):
             # Novell "raw" 802.3
             self.type = ETH_TYPE_IPX
-            self.data = self.ipx = self._typesw[ETH_TYPE_IPX](self.data[2:])
+            self._decode_payload(lambda: self._typesw[ETH_TYPE_IPX],
+                                 self.data[2:], ETH_TYPE_IPX)
 
         elif self.type == ETH_TYPE_UNKNOWN:
             # Unknown type, assume Ethernet
@@ -171,6 +179,10 @@ class Ethernet(dpkt.Packet):
 
             # actual size of the remaining data, could include eth body, padding, fcs, trailer
             data_len = len(self.data)
+            if data_len < eth_len:
+                # the 802.3 length says the body is longer than what was captured
+                self._note_truncated(eth_len, data_len, what='802.3 body')
+                eth_len = data_len
             if data_len > eth_len:
                 # everything after eth body
                 tail = self.data[eth_len:]
@@ -196,7 +208,7 @@ class Ethernet(dpkt.Packet):
                 if tail:
                     self.trailer = tail
 
-            self.data = self.llc = llc.LLC(self.data[:eth_len])
+            self._decode_payload(lambda: llc.LLC, self.data[:eth_len], 'LLC')
 
     def pack_hdr(self):
         tags_buf = b''

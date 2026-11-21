@@ -79,6 +79,14 @@ dpkt.crc32c module
     :undoc-members:
     :show-inheritance:
 
+dpkt.defrag module
+------------------
+
+.. automodule:: dpkt.defrag
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 dpkt.dhcp module
 ----------------
 
@@ -515,6 +523,14 @@ dpkt.udp module
 ---------------
 
 .. automodule:: dpkt.udp
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+dpkt.validation module
+----------------------
+
+.. automodule:: dpkt.validation
     :members:
     :undoc-members:
     :show-inheritance:

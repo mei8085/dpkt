@@ -35,21 +35,23 @@ class LLC(dpkt.Packet):
 
         dpkt.Packet.unpack(self, buf)
         if self.is_snap:
+            if len(self.data) < 5:
+                raise dpkt.TruncatedPacket(
+                    'LLC/SNAP header needs 5 bytes, got %d' % len(self.data))
             self.oui, self.type = struct.unpack('>IH', b'\x00' + self.data[:5])
             self.data = self.data[5:]
-            try:
-                self.data = Ethernet.get_type(self.type)(self.data)
-                setattr(self, self.data.__class__.__name__.lower(), self.data)
-            except (KeyError, dpkt.UnpackError):
-                pass
+            self._decode_payload(lambda: Ethernet.get_type(self.type),
+                                 self.data, self.type)
         else:
-            # non-SNAP
+            # non-SNAP; an unknown SAP leaves the payload raw
             if self.dsap == 0x06:  # SAP_IP
-                self.data = self.ip = Ethernet.get_type(ETH_TYPE_IP)(self.data)
+                self._decode_payload(lambda: Ethernet.get_type(ETH_TYPE_IP),
+                                     self.data, ETH_TYPE_IP)
             elif self.dsap == 0x10 or self.dsap == 0xe0:  # SAP_NETWARE{1,2}
-                self.data = self.ipx = Ethernet.get_type(ETH_TYPE_IPX)(self.data)
+                self._decode_payload(lambda: Ethernet.get_type(ETH_TYPE_IPX),
+                                     self.data, ETH_TYPE_IPX)
             elif self.dsap == 0x42:  # SAP_STP
-                self.data = self.stp = stp.STP(self.data)
+                self._decode_payload(lambda: stp.STP, self.data, 'STP')
 
     def pack_hdr(self):
         buf = dpkt.Packet.pack_hdr(self)

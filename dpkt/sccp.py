@@ -3,6 +3,8 @@
 """Cisco Skinny Client Control Protocol."""
 from __future__ import absolute_import
 
+import struct
+
 from . import dpkt
 
 KEYPAD_BUTTON = 0x00000003
@@ -219,11 +221,20 @@ class SCCP(dpkt.Packet):
         if n > len(self.data):
             raise dpkt.NeedData('not enough data')
         self.msg, self.data = self.data[:n], self.data[n:]
+        # the message body is a sub-packet of this layer; decode it without
+        # touching self.data (which is the remainder after the message)
         try:
             p = self._msgsw[self.msgid](self.msg)
-            setattr(self, p.__class__.__name__.lower(), p)
-        except (KeyError, dpkt.UnpackError):
-            pass
+        except KeyError:
+            self._note_undecoded(self.msgid,
+                                 'no decoder registered for SCCP message %r' % (self.msgid,))
+            return
+        except (dpkt.UnpackError, struct.error) as e:
+            self._note_undecoded(self.msgid,
+                                 'SCCP message %r could not be decoded: %s' % (self.msgid, e),
+                                 error=e)
+            return
+        setattr(self, p.__class__.__name__.lower(), p)
 
 
 def test_sccp():
